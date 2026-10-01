@@ -1,0 +1,9 @@
+// Auto-generated from codesynth/song_dsp.h by CMake (configure_file). DO NOT EDIT.
+// Exposes the shared sample-DSP source as a C string so SteepSynthEngine's
+// "Save C Song" can inline it verbatim into exported song.c -- keeping live
+// playback and exported code from the same single source of truth.
+#pragma once
+static const char kSongDspSource[] =
+R"SONGDSP(
+@SONG_DSP_H_CONTENT@
+)SONGDSP";

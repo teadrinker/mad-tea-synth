@@ -1,0 +1,1233 @@
+//---- common ----\\
+
+#rewire f64 -> fx16
+#enable strict_indent
+#enable c_division // integer '/' truncates
+
+const intro = 10
+
+const halfw = width  / 2
+const halfh = height / 2
+const hard_w = 200 // visuals scale are tweaked for pixels, so keep these hard coded for all targets
+const hard_h = 228
+const offx = (width  - hard_w) / 2
+const offy = (height - hard_h) / 2
+
+const proj_xoffset = halfw - 100   
+const proj_w      = hard_w
+const proj_h      = hard_h + 1   // + 1 : drawing a line in center should be sharp line 
+const proj_aspect = 0.8733624454148472  // width / (height + 1.0)
+
+
+
+rot = (p:[], id1, id2, a) => 
+    cosa = cos(a) ; sina = sin(a)
+    tmp    = p[id1] * cosa - p[id2] * sina
+    p[id2] = p[id2] * cosa + p[id1] * sina
+    p[id1] = tmp
+
+
+do3d = (p:[], r1, r2, r3, w=proj_w, h=proj_h, aspect=proj_aspect, mul=0.01, dist=2.7, xoffset = proj_xoffset) => 
+    rot(p, 0, 2, r1)
+    rot(p, 1, 2, r2)
+    rot(p, 0, 1, r3)
+    x = p[0] * mul
+    y = p[1] * mul
+    z = p[2] * mul + dist
+    return [w*((x/z) + 0.5) + xoffset, aspect*h*y/z + h*0.5] 
+
+
+rsmul = (x, a) => a*x / (2.0 * a*x - a - x + 1.0) 
+
+warp_offset = a => rsmul(a, 0.792) * 0.26795  
+
+rhythmic_time_warp = (x:fx16, amount, beatlength = 0.1, symmetric = 0) => 
+    a = beatlength/3.5
+    sym = 0.0
+    if symmetric > 0
+        sym = - amount * a + amount/2 + amount * (smootherstep(-a*2.5, a*2.5, frac(x+0.5) - 0.5) - frac(x+0.5))
+        if symmetric == 1.0
+            return x + sym
+    y = frac(x + warp_offset(a));
+    y = ( 1.0 - (1 + y/a) * exp(-y/a) ) * (1 - y);
+    return x + amount * y * (1-symmetric) + symmetric * sym;
+
+
+filtered_superpw = (x, pw, f) => 
+    x = frac(x)
+    t0 = 0.1875
+    t1 = t0 + pw * 1 / 8
+    t2 = t0 + pw * 2 / 8
+    t3 = t0 + pw * 3 / 8
+    t4 = t0 + pw * 4 / 8
+    t5 = 1.0 - t0
+    o  = linearstep(t0 - f, t0 + f, x) - linearstep(t5 - f, t5 + f, x) 
+    o -= linearstep(t1 - f, t1 + f, x) - linearstep(t2 - f, t2 + f, x)
+    o -= linearstep(t3 - f, t3 + f, x) - linearstep(t4 - f, t4 + f, x)
+    return o - 0.5
+
+
+#define vo_min_size (b >= 98 && b <101 ? 4 : 2)
+
+//---- globals ----\\
+
+
+
+// visual \\
+
+kick : fx22 = -10
+snare : fx22 = -10
+stabby : fx22 = -10
+stab : fx22 = -10
+
+//---- pwm, 1, 36, fix ----\\
+
+#rewire f64 -> fx22; 
+b = beat
+x = phase
+// #enable undefined_behaviour;
+// xx = x*2;  
+// ( max(0, 0.941 - xx*6) * ((xx * 110) % 2.0 - 1.0) )
+// ( max(0, 0.941 - xx*6) * (frac(xx* 55)*2-1) )
+//  -0.005
+// + (frac(x)*2 - frac(x+b/8))/2
+//  - frac(x*2-b/4)/2.1  // * exp(-32*t)
+//  
+(frac(x)*2 - frac(x+b/8-pan*0.15)) / 3
+ - frac(x*2-b/4) * max(0,1-t*24)
+
+//---- kick, 10, 36, fix ----\\
+
+// #rewire f64 -> fx16
+// clamp(
+//  sin01(sqrt(t as fx16) * 33)  * (1-frac(b*4)**2) 
+    sin01(sqrt(t as fx16) * 33)  * (1-min(1,(t as fx16 * 8.347))**2) 
+*1.171
+ // ,-1,1)
+
+// visual \\
+
+b = beat
+if abs(b-kick) > 0.5 then kick = b
+
+//---- snare, 10, 38, fix ----\\
+
+// WAV snd/snare.wav, degrade=-27.0, hp=100, lp=9000 \\
+
+#rewire f64 -> fx22
+  
+//   smp(rate, 0) *2
+//  
+smp(rate, -0.4) 
+    *3.5
+
+// visual \\
+
+b = beat
+if vel > 126 && abs(b-snare) > 0.5 then snare = b
+
+//---- tick, 10, 20, fix ----\\
+
+// WAV snd/tick.wav, degrade=-24.0, trim=20 12 8 \\
+
+#rewire f64 -> fx22
+smp(rate, 0)
+
+//---- tock, 10, 21, fix ----\\
+
+// WAV snd/tock.wav, degrade=-24.0, trim=50 12 8 \\
+
+#rewire f64 -> fx22
+smp(rate, 1 )
+
+//---- clock, 10, 22, fix, order=-1 ----\\
+
+
+
+// visual \\
+
+#rewire f64 -> fx19   
+#disable safe_div_by_zero
+#enable lossy_assignment
+b = beat
+// #enable undefined_behaviour
+//   #rewire f64 -> f32
+background(0);
+
+sync = linearstep(1,0,b - kick)**3
+
+b -= intro
+// text(100,8,10,2,''+b)
+inv = b>18 && b<26  || vel == 126 // || b>34.25 && b<40
+
+offset = -10 + b//*180
+cx = halfw; cy = halfh;
+linew = clamp(1.5+sync*3, 1+inv, 3); capheight = 18 ;
+
+rot = smoothstep(18,20,b) * (linearstepa(27,35,b)/4.9 - smoothstep(297,288,b) * 0.5 * cos01(b/8))/6;
+sanim = smoothstep(18,20,b) *0.3
+sanimt = b / 4
+rectstyle = b < 10 || inv || b > 294?  0.0 : 0.5 + 0.5 * cos01(b/4);   
+
+bleed = rectstyle*2 - inv*2;                    
+R     = 100 + bleed;                
+rectw = 100 + bleed;              
+recth = 114 + bleed;            
+
+minlen  = 4+rectstyle*4 + sync*12 + inv*4;  minw  = 1.3 + inv*0.5;  
+hourlen = 8+rectstyle*2 + sync*4  + inv*2;  hourw = 5.5;           
+quartlen = 8            + sync*4  + inv*2;   // 12 / 3 / 6 / 9 
+numinset   = 26;                   
+frameinset = 27;                  
+colgap = rectw*0.545;      // 11 12 1  /  7 6 5   
+rowgap = recth*0.42;       // 2 3 4    /  10 9 8  
+
+// tt = 13.0*3600 + 37*60 + offset;// + (b as fx16);      // 13:37
+tt = offset;// + (b as fx16);      // 13:37
+rota = rot   + linearstepa(20,25,b) / 15
+ah = -rota   + tt/43200 + 1.5/12.0;         
+am =  rota   + (floor(tt/60)+37)/60;  
+as =  6*rota + floor(tt)/60;        
+
+px = [0.0,0,0,0,0,0,0,0,0,0,0,0]; py = [0.0,0,0,0,0,0,0,0,0,0,0,0];
+
+i = 0;
+while i < 60 
+    a = i / 60.0 + rot
+    sx = sin01(a)
+    sy = -cos01(a)
+    rr = R + (min(rectw/max(abs(sx),0.1), recth/max(abs(sy),0.1)) - R) * rectstyle
+    L = minlen; w = minw;
+    if(i % 5  == 0) { L = hourlen; w = hourw }
+    if(i % 15 == 0) { L = quartlen }
+    
+    if b<297.5 then line(cx + sx*rr, cy + sy*rr, cx + sx*(rr-L-bleed), cy + sy*(rr-L-bleed), w, 1.0, 0)
+    
+    if i % 5 == 0 
+        j = i/5;
+        nx = cx + sx*(R-numinset); ny = cy + sy*(R-numinset);   // round target
+        m = j; if(m > 7) { m = m - 12 }                         // 8..11 -> -4..-1
+        fx = cx; fy = cy;                                       // frame target
+        if(m >= -1 && m <= 1) { fx = cx + m*colgap;           fy = cy - recth + frameinset }
+        if(m >=  2 && m <= 4) { fx = cx + rectw - frameinset; fy = cy + (m-3)*rowgap }
+        if(m >=  5)           { fx = cx - (m-6)*colgap;       fy = cy + recth - frameinset }
+        if(m <= -2)           { fx = cx - rectw + frameinset; fy = cy - (m+3)*rowgap }
+        px[j] = nx + (fx-nx)*rectstyle; py[j] = ny + (fy-ny)*rectstyle;
+    
+    i = i + 1;
+
+// capheight*=0.1
+if b<294
+    text(px[0],  py[0],  capheight * (1+sanim*(sin01(sanimt + 0.0/12)-0.4)), linew, "12");
+    text(px[1],  py[1],  capheight * (1+sanim*(sin01(sanimt + 1.0/12)-0.4)), linew, "1");
+    text(px[2],  py[2],  capheight * (1+sanim*(sin01(sanimt + 2.0/12)-0.4)), linew, "2");
+    text(px[3],  py[3],  capheight * (1+sanim*(sin01(sanimt + 3.0/12)-0.4)), linew, "3");
+    text(px[4],  py[4],  capheight * (1+sanim*(sin01(sanimt + 4.0/12)-0.4)), linew, "4");
+    text(px[5],  py[5],  capheight * (1+sanim*(sin01(sanimt + 5.0/12)-0.4)), linew, "5");
+    text(px[6],  py[6],  capheight * (1+sanim*(sin01(sanimt + 6.0/12)-0.4)), linew, "6");
+    text(px[7],  py[7],  capheight * (1+sanim*(sin01(sanimt + 7.0/12)-0.4)), linew, "7");
+    text(px[8],  py[8],  capheight * (1+sanim*(sin01(sanimt + 8.0/12)-0.4)), linew, "8");
+    text(px[9],  py[9],  capheight * (1+sanim*(sin01(sanimt + 9.0/12)-0.4)), linew, "9");
+    text(px[10], py[10], capheight * (1+sanim*(sin01(sanimt + 10.0/12)-0.4)), linew, "10");
+    text(px[11], py[11], capheight * (1+sanim*(sin01(sanimt + 11.0/12)-0.4)), linew, "11");
+
+
+if b<296 then line(cx - sin01(ah)*10, cy + cos01(ah)*10, cx + sin01(ah)*R*0.5, cy - cos01(ah)*R*0.5, 5   + inv*2, 1.0, 0)
+if b<295 then line(cx - sin01(am)*14, cy + cos01(am)*14, cx + sin01(am)*R*0.8, cy - cos01(am)*R*0.8, 3   + inv*2, 1.0, 0)
+if b<294 then line(cx - sin01(as)*20, cy + cos01(as)*20, cx + sin01(as)*R*0.9, cy - cos01(as)*R*0.9, 1.3        , 1.0, 0)
+
+
+// rect(10,21,81,63,6);
+// rect(0,0,200,228,63,01,1);
+
+if inv then circle(halfw, halfh ,100, 1, 1)
+
+//---- vo_what, 11, 20, fix, order=1 ----\\
+
+// WAV snd/vo_what.wav, degrade=-25, trim=0 0 8 \\
+
+#rewire f64 -> fx22
+smp(rate, 1.0)
+
+// visual \\
+
+// #rewire f64->fx16
+b = beat
+if(vel&1) {
+    font 2
+    s = 35 * (0.3 + 0.7*vel/127)
+//     boxw=118;boxh=56
+//     rect(100-boxw/2, 70-boxh/2, boxw, boxh, 0)
+    const whaty = halfh - 44
+    text(halfw,whaty,s,clamp((6-t*40)*(vel/127),vo_min_size,6),'What',1.0);
+    font 0
+}
+// s = 3//21
+// text(159,114,10*s,0.662*s,'teadrinker',1,-1*s);
+// text(100,114,10*s,2*s,'MARTY',1);
+// glyph(101,114,10*s,2*s,65);
+
+// s = 12
+// d=0.96
+// c='goofier'
+// xx = 303
+// text(xx,114,10*s,2.5*s*d,c,1);
+// text(xx+s/8,114,10*s,2.17*s*d,c,1);
+// text(xx+s/2,114,10*s,1.3*s*d,c,1);
+//
+
+//---- vo_time, 11, 50, fix, order=1 ----\\
+
+// WAV snd/vo_time.wav, degrade=-28.7, trim=0 0 8 \\
+
+smp(rate, 1.0 )
+
+// visual \\
+
+#rewire f64 -> fx22
+
+b = beat
+
+if vel & 1 && vel > 114
+    font_grade = clamp(8 - t*40, vo_min_size, 8)
+    text(halfw, halfh, 40, font_grade, 'TIME', 1)
+
+//---- vo_is, 11, 80, fix, order=1 ----\\
+
+// WAV snd/vo_is.wav, degrade=-26.7, trim=0 0 8 \\
+
+#rewire f64 -> fx22
+smp(rate, 1.0 )
+
+// visual \\
+
+b = beat
+if(vel&1) {
+    font 2
+//     boxw=72;boxh=56
+//     rect(100-boxw/2, 151-boxh/2, boxw, boxh, 0)
+    const isy = halfh + 36
+    text(halfw,isy,35,clamp(6-t*40,vo_min_size,6),'is',1.0);
+    font 0
+}
+
+//---- vo_it, 11, 110, fix, order=1 ----\\
+
+// WAV snd/vo_it.wav, degrade=-27, trim=0 0 8 \\
+
+#rewire f64 -> fx22
+smp(rate, 1.0 )
+
+// visual \\
+
+b = beat
+if(vel&1) {
+    
+    font 2
+//     boxw=89;boxh=54
+//     rect(113-boxw/2, 189-boxh/2, boxw, boxh, 0)
+    const ity = halfh + 71
+    text(halfw,ity,35,clamp(6-t*40,vo_min_size,6),' it?',1.0);
+    font 0
+}
+
+//---- tunnel, 10, 23, fix, order=-1 ----\\
+
+
+
+// visual \\
+
+#rewire f64 -> fx16   
+b = beat
+// #rewire f32 -> fx16   
+background(0)
+
+i = 1
+fi = frac(b/4)
+n = 30
+sync = 0.0
+// sync = max(sync, linearstep(0.5,0,b - snare)**3)
+// sync = max(sync, linearstep(0.5,0,b - kick)**3)
+// sync = max(sync, linearstep(1,0,b - stabby)**3)
+sync =  linearstep(0.3,0,b - stabby)
+// + linearstep(0.5,0,b - kick)**3
+b -= intro
+// text(100,8,10,2,""+b,0.2)
+fadeout = linearstep(73,71,b) + (vel==1)
+// lockrhythm = 0.5+0.5*sin01(b/21+0.76)
+lockrhythm = linearstep(45,53,b) * linearstep(63,55,b)
+b = rhythmic_time_warp(b+0.1, lockrhythm, 0.181, 1) as fx22
+if(fadeout < 0.8) { sync = 0.0 }
+while(i<n) {
+ts = 2
+fi = i+frac(b*ts)
+time = b*ts-fi - 5*b 
+s = 46.5/((n+1-fi)+1.1  ) 
+cx = ( halfw+(sin01(fi/25.0+time/40)*6)*s ) as fx16; 
+cy = ( halfh+cos01(fi/20.0+time/30)*6*s ) as fx16;
+rot = time/121+0.228*sin(time/13) 
+ah =  rot ;         
+am = -2*rot ;  
+// as = 2*rot;    
+sig = sync > 0.5 ? 1 : -1
+alphaC = linearstep(0,n/3,i)*linearstep(0,n/8,n-i)*fadeout
+ioffs = floor(b as fx16 *ts) as i32
+if((ioffs ^ i) & 1) {
+    if(ioffs-i > 96+10){
+    line(cx - sin01(ah)*s*10   , cy + cos01(ah)*s*10, 
+         cx + sin01(ah)*s*1.4,   cy - cos01(ah)*s*1.4,  sig*1.5*s, max(alphaC*0.7,sync),0);
+    }
+    if(ioffs-i > 90){
+    line(cx - sin01(am)*s*14,    cy + cos01(am)*s*14, 
+         cx + sin01(am)*s*2.68,  cy - cos01(am)*s*2.68, sig*0.8*s, alphaC*0.7+sync/2,0);
+    }
+    // line(cx - sin01(as)*s*18,     cy + cos01(as)*s*18, 
+    //      cx + sin01(as)*s*0.76, cy - cos01(as)*s*0.76, -0.15*s, 0);
+if(ioffs-i > 76){
+//    rect(cx-s/8,cy-s/8,s/4,s/4,0)
+//    circle(cx,cy,-s/4,alphaC,0)
+//     circle(cx,cy,s/4,alphaC,-2)
+    circle(cx,cy,sig*s/4,alphaC,1)
+//     circle(cx,cy,-s/2,alphaC,0)
+}
+//     ps=s/18
+//     point(cx+ps*1.4,cy,1,0)
+//     point(cx-ps*1.4,cy,1,0)
+//     point(cx,cy+ps*1.4,1,0)
+//     point(cx,cy-ps*1.4,1,0)
+//     point(cx+ps,cy+ps,1,0)
+//     point(cx-ps,cy-ps,1,0)
+//     point(cx+ps,cy-ps,1,0)
+//     point(cx-ps,cy+ps,1,0)
+}
+j=0
+alpha = linearstep(0,n/4,i) * fadeout //*(1-frac(b)**2)
+while(j<60) {
+ fj = j/60.0
+ point(cx - sin01(fj)*s*14, 
+          cy - cos01(fj)*s*14,alpha,0) 
+//  putpixel(cx - sin01(fj)*s*14, 
+//           cy - cos01(fj)*s*14,(i-ioffs)*9)
+j = j + 1
+}
+i=i+1
+}
+
+//---- big_text, 12, 0, fix, order=1 ----\\
+
+
+
+// visual \\
+
+#rewire f64 -> fx22
+#rewire literal i32 -> fx22
+nn = note
+// #disable inline_powers
+// nn = 66
+// vel = 127
+
+size = 16
+grade = 8
+animAmt = vel==127?1:frac(2.0*(vel/127))
+anim = 1.0 - linearstep(vel==127?2:1/6, 0, t  )**3 * animAmt
+grade = 1.0 + (grade-1.0) * anim
+if(nn>32) { 
+//  size = 17
+  background(vel<64?63:0)
+// glyph(100+grade*6,114,20,4,65,1)
+  glyph(halfw,halfh,10*size,size*grade/4,nn,1.0,1)
+//  return 0;
+}
+t1 = "DEMO
+TIME"
+t2 = 'GREETZ
+TIME'
+t3 = 'TEA
+TIME'
+t4 = 'END
+TIMES'
+t5 = 'TIME
+IS
+UP!'
+c=''
+lh = 0
+ls = 0
+anim = 1.0 - linearstep(1, 0, t*(vel/127)/3.5  )**4
+if(nn==0) { size = 5 ; c = t1 }
+if(nn==1) { size = 5 ; c = t2 ; lh = 55 ; ls = -20*(1-anim) }
+if(nn==2) { size = 5 ; c = t3 ; lh = 163; ls = -11*(1-anim) }
+if(nn==3) { size = 4 ; c = t4 ; lh = 167; ls = -11*(1-anim) }
+if(nn==4) { size = 4 ; c = t5 ; lh = 82; ls = -11*(1-anim) }
+grade = 0.0 + (10-0.0) * (1-anim)
+s = size+(1-anim)*0
+// text(100,114,7*s,s*grade/8+1,c,1,0,s*5+(1-anim)*20.0+ls  ,lh);
+text(halfw-(1-anim)**2*12,halfh,7*s,s*grade/8,c,1,2|4,s*6+(1-anim)*20.0+ls,lh);
+text(halfw               ,halfh,7*s,s*grade/8,c,1,2|8,s*6+(1-anim)*20.0+ls,lh);
+text(halfw+(1-anim)**2*12,halfh,7*s,s*grade/8,c,1,4|8,s*6+(1-anim)*20.0+ls,lh);
+
+//---- bass, 3, 32, fix ----\\
+
+// WAV snd/reform-bass-n32.wav, degrade=-32, trim_end=22 1 8 \\
+
+// #rewire f64 -> fx22
+
+// smp(rate-sin01(beat*0.125+pan*0.25)*0.01, 0.25) 
+smp(rate, 0.25+pan*0.3)
+
+// visual \\
+
+b = beat
+if abs(stabby-b) > 0.5 then stabby = b
+
+//---- stab, 3, 61, fix ----\\
+
+// WAV snd/daydreamer-stab-n61.wav, degrade=-20, trim_end=31 1 8 \\
+
+#rewire f64 -> fx22
+  
+smp(rate-cos01(beat*0.012)*0.0005*pan, 0.2)  
+// smp(rate, -0.25)*  1.7
+
+// visual \\
+
+b = beat
+if abs(stabby-b) > 0.5 then stabby = b
+if abs(b-stab  ) > 0.5 then stab   = b
+
+//---- bass2, 5, 25, fix ----\\
+
+#rewire f64 -> fx16; 
+b = beat
+x = phase
+// filter = (0.5 + 0.5 * cos01(b*4)) * linearstep(0,0.11,t)
+filter =  linearstep(0,0.316,t) 
+f=filter**3.0*0.1875
+pw=0.5+0.47*cos01(0.5+b/2.5  ) - pan*0.08  
+
+
+filtered_superpw(x, pw, f)
+
+// x=frac(x)
+// of = 0.1875
+// t1 = of+pw*1/8
+// t2 = of+pw*2/8
+// t3 = of+pw*3/8
+// t4 = of+pw*4/8
+// o =      linearstep(of-f, of+f,x)-linearstep(1-of-f, 1-of+f,x) 
+// o = o - (linearstep(t1-f, t1+f,x)-linearstep(  t2-f,   t2+f,x)) 
+// o = o - (linearstep(t3-f, t3+f,x)-linearstep(  t4-f,   t4+f,x)) 
+// 
+// o-0.5
+
+//---- lead, 6, 26, fix ----\\
+
+#rewire f64 -> fx16    
+b = beat
+x = phase
+// filter =   linearstep(0,0.789,t) *cos01(b*3    )
+filter = 0.5 + 0.2 * cos01(b*2    )
+f=filter**3.0*0.1875
+pw=0.7+0.30 *cos01(0.5+b/8  ) + pan*0.05 
+x*=0.5
+
+filtered_superpw(x + pan*0.018 , pw, f) * 0.5 * (1+0.45*cos01(b/6+pan*0.25))
+
+// x=frac(x)
+// of = 0.1875
+// t1 = of+pw*1/8
+// t2 = of+pw*2/8
+// t3 = of+pw*3/8
+// t4 = of+pw*4/8
+// o =      linearstep(of-f, of+f,x)-linearstep(1-of-f, 1-of+f,x) 
+// o = o - (linearstep(t1-f, t1+f,x)-linearstep(  t2-f,   t2+f,x)) 
+// o = o - (linearstep(t3-f, t3+f,x)-linearstep(  t4-f,   t4+f,x)) 
+// 
+// (o-0.5)/2.0
+
+//---- tea1, 10, 25, fix ----\\
+
+
+
+// visual \\
+
+// #rewire f64 -> fx16
+
+b = beat
+end = vel < 10
+
+// myfun = p => p
+myfun = p => [p[0], p[1], p[1]]
+// 
+background(0);
+// teadrinker logo pixeldisplay1.png 208x176, res 16, 15 spans
+spans = [1049601,3146758,2099201,9439233,1051649,9440258,1052674,8392708,1053705,11539457,1054729,11540481,2104329,2105351,3154949];
+rb = rhythmic_time_warp(b, 0.4) //as fx22
+sc = end ? 0.0017 : 0.013
+for span in spans
+    spanx = ((span >> 20) & 1023) * 16
+    spany = ((span >> 10) & 1023) * 16
+    spanw = ( span        & 1023) * 16
+    for i in 0..2
+        cx = 16*6; cy = 16*5
+        x1 = spanx         - cx
+        y1 = spany + i*8   - cy
+        z1 = 0
+        x2 = spanx + spanw - cx
+        y2 = y1            
+        z2 = 0
+        
+        r1 = end ? 0 : rb
+        r2 = end ? 0 : 0.2
+        r3 = end ? 0 : 0.18
+        p1 = do3d([x1,y1,z1],r1,r2,r3,proj_w, proj_h, proj_aspect, sc)
+        p2 = do3d([x2,y2,z2],r1,r2,r3,proj_w, proj_h, proj_aspect, sc)
+        
+        line(p1[0],p1[1], p2[0],p2[1], end ? 1 : 2);
+
+//---- tea3, 10, 27, fix, order=-1 ----\\
+
+
+
+// visual \\
+
+#rewire f64 -> fx22
+b = beat
+
+// myfun = p => p
+// myfun = p => [p[0], p[1], p[1]]
+// 
+background(0);
+sync = 0.0
+sync  = linearstep(0.5, 0, b - snare) as fx22
+sync -= linearstep(0.5, 0, b - kick) 
+if b>=98 && b<100 
+    b = 98 as fx22
+    sync = 1.0
+else if b>=100
+    b -= 2 
+    sync += 0.5*linearstep(0.5,0,b - stabby)**1
+else
+    sync = linearstep(0.5,0,b - stabby) as fx22
+
+// text(100,8,10,2,""+b,0.2)
+t = (b - 84)/2.07
+  
+spans = [18877448,4198403,13635602,4199428,10490903,5249027,11540504,5250052,11541511,27270154,6299651,12591105,32514054,6300676,34612229,7350275,35661829,8399875,36711428,4206594,9449474,37761028,4207619,10499074,37762052,4208644,11548673,37763079,4209668,37764105,4210693,36716555,4211718,35669005,4212743,34621447,44058629,4213769,32525321,45108229,4214798,27283470,46157828,4215844,46158852,4216868,46159876,5266466,46160900,5267490,46161924,5268514,46162948,6318112,46163972,6319136,45116420,6320169,7369767,7370790,8420387,8421404,9471002,10520600,11570198,12619796,13669394,14718992,16817164];
+whitebg = smoothstep(2.5,2,t)
+lineW = smootherstep(1.91  ,1.9,t)
+lineWid = (-1.5-0.5*(frac(-b)>0.5)) * lineW + (1-lineW)
+// lineWid = 1  
+rh = 94 * whitebg
+size = 0.674978 + 0.5 * smootherstep(2,4,t)
+
+sync *= smoothstep(1,3,t)
+for span in spans
+    spanx = ((span >> 20) & 1023) * 4
+    spany = ((span >> 10) & 1023) * 4
+    spanw = ( span        & 1023) * 4
+    i = 0; 
+    while i < 1
+        cx = 16*6; cy = 16*5
+        
+        x1 = (spanx         - cx)*size
+        y1 = (spany + i*4   - cy)*size
+        z1 = 0
+        x2 = (spanx + spanw - cx)*size
+        y2 = y1            
+        z2 = 0
+        
+        //   
+        r1 = (smoothstepa(2, 3, t) * 2 + smoothstep(2, 4 , t) * 0.02 * spany * sin01(b/8 - 0.45))
+        //   r2 = 0.0
+        r2 = 4.363 * smoothstepa(4, 8, t) * sin(t/2)// + 0.01*spany*sin(b/6)
+        r3 = 0//smoothstepa(4,7,t)*sin(t/3) // + 0.001*spany*sin01(b/6)
+        p1 = do3d([x1,y1,z1], r1, r2, r3)
+        p2 = do3d([x2,y2,z2], r1, r2, r3)
+        
+        if sync == 0 
+            line(p1[0],p1[1], p2[0],p2[1], lineWid,1,0);
+        else
+            line(p1[0]+sync*20,p1[1], p2[0]+sync*20,p2[1], lineWid,1,2|4)
+            line(p1[0]+sync*10,p1[1], p2[0]+sync*10,p2[1], lineWid,1,2|8)
+            line(p1[0]-sync*15,p1[1], p2[0]-sync*15,p2[1], lineWid,1,4|8)
+        i = i + 1
+
+rect(0, halfh - rh/2, width, rh, 0, 1.0, 1)
+
+//---- matrix, 10, 29, fix, order=-1 ----\\
+
+
+
+// visual \\
+
+#rewire f64 -> fx16  
+b = beat
+// #rewire f64->fx16
+cube        = vel == 1 ? 1 : 0
+bounce_only = vel == 2 ? 1 : 0
+clock       = vel == 3 ? 1 : 0
+inv = vel==127 //(b>135)*(b<156)*b*0.125&1
+dogreetz = vel>100 
+dospiral = vel<64
+
+if bounce_only || clock
+    dogreetz = 0
+    dospiral = 0
+
+// do_huge  = vel==127
+
+background(inv * 63);
+//    text(100,8,10,2,""+b,1,1)
+// 
+// for(i=0;i<6;i++) {
+// rect(0,i*24*2+5,200,24,(1-inv) * 63)
+// }
+
+// for(i=1;i<8;i++) {
+//     for(j=0;j<11;j++) {
+//         if(((i|0)^(j|0))&1) {
+//             wi = 16
+//             rect(j*wi+12,i*12*2+5,wi,24,(1-inv) * 63)
+//         }
+//     }
+// }
+
+// rect(2,2,2,1,63)
+// line(2,2.5, 4,2.5,1)
+// glyph(100,100,10,2,65)
+// glyph(100,140,20,4,65)
+// 
+// glyph(120.05,100,10,2,65)
+// glyph(120.0,140,20,4,65)
+// font(0)
+s=20
+// sv = (32+0*frac(b/4)*(126-32))
+// i = 0
+// for(my=0; my<224; my += s+s/5) {
+// for(mx=0; mx<200; mx += s-s/5) {
+// glyph(s/3+mx,s/2+my,s,s/5,sv+(i+20)&127)
+// i++
+// }
+// }
+
+// text(46,20,s,s/5,'HELLO there, I love your style!')
+
+// for(yy=0; yy<19; yy++) {
+// for(xx=0; xx<25; xx++) {
+// glyph(3+xx*8,5+yy*12,10,2,65)
+// i++   
+// }
+// }
+bw = rhythmic_time_warp(b-148, 0.6+0.4*sin01(b/21+0.76), 0.2, 1) as fx22
+
+greetz =("/BionFX*Konsumer*Slipstream*Still"
+         "*Poo-Brain*MemoryLeek*Approximate*Desire"
+         "*Gray Marchers*Alcatraz*Limp Ninja/")
+greetz2 =("\\\\\\\\\\\\\\RGBA*RAGE*TRAUMA*ALTAIR*CONSPIRACY"
+          "*ASD*FAIRLIGHT*COCOON*MERCURY*LOGICOMA*NUANCE"
+          "*GASPODE*0B5VR*PS*JEENIO*HAQ*UNLORD*TENFOUR\\")
+
+lut_a = "          ...............,,,,,,,,,,:::::::::;;;;;;;;;;------------_________*****~~~~~~!!!!!!^^^^^++++++++rrrrr))(((>><<<====?????????JJJJJLvvcccjjj7{{YYY1iilllCCCCzznFFtttyyooIIppssssaaZ22hP3eSmX44g5dww##@EEKKKOOOGH$$DDDAA69QQQQ00000888&&BBNNNNNMMMMMMMMWWW" 
+lut_b = "                   ''''''''''`````::::::::" '"""""""""""""""""' "------------**********~~~~~~!!!!!!^^^^^++++++++rrr))))(((>><<<====?????????JJJJJLvvcccjjj7{{YYY1iilllCCCCzznFFtttyyooIIppssssaaZ22hP3eSmX44g5dww##@EEKKKOOOGH$$DDDAA69QQQQ00000888&&BBNNNNNMMMMMMMMWW"
+// 
+ofs = 8.5
+force_big   = (b > 185)*(b*0.5&1 )
+force_small = (b > 185)*(b    &1 )
+if b > 207 
+    force_big   = 0
+    force_small = 0
+
+
+im = image_alloc(24,18)
+// text(100,8,10,2,''+b)
+push_target(im)
+
+// if(do_huge) {
+// 
+//     text_align 1
+//     text(7+24-((b-198)*10), 8, 20, 5, "TREPAAN",1,0,15)
+//     text_align 0  
+// 
+// }
+
+if !dospiral
+
+   // pulsing clock 
+
+    if b>196 && dogreetz
+        text_align 1
+        text(7+24-((b-196)*10), 9, 20, 5, "\"_TREPAAN",1,0,15)
+        text_align 0  
+
+    hands =    (1-linearstep(197,199,b)) * linearstep(159,168,b) + clock*0.8928
+    base_size = 1-smoothstep(198,201,b) + bounce_only*0.8928 + clock
+
+
+//     line(12.0 + 11*cos01(bb    ), 9.0  - 7*sin01(bb    ),
+//          12.0 + 11*cos01(bb+0.5), 9.0  - 7*sin01(bb+0.5),2,1.0,0)
+// 
+    bounce_amt = smoothstep(162,179,b) * smoothstep(200,178,b) * 0.7+ bounce_only*1.6 + clock * 0.1 
+    bounce = (3+16*frac(b) * (frac(b)-1)) * bounce_amt
+
+    bb = mix(0.03-b/183-smootherstepa(175,200,b)**2/20, -b*0.1, clock)
+    const alpha = 1//frac(-b)
+    line(12.0 + 11*cos01(bb)  *0.7, 9.0  - 7*sin01(bb)  *0.7 + bounce,
+          12.0 - 11*cos01(bb)/4*0.7, 9.0  + 7*sin01(bb)/4*0.7 + bounce,1.9,alpha*hands,0)
+    bbb = bb * 12
+    line(12.0 + 11*cos01(bbb)  , 9.0  - 7*sin01(bbb)         + bounce,
+          12.0 - 11*cos01(bbb)/4, 9.0  + 7*sin01(bbb)/4       + bounce,1.504,alpha*hands,0)
+//     latest = max(stabby,kick)
+    latest = stabby
+    anm = linearstep(1,0,b-latest )**4
+
+    elip_size = base_size*(0.9 + anm*0.3 - 0.06) 
+    ellipse(12,9 + bounce, 12*elip_size,8*elip_size,0.97+anm*0.03,1)
+
+else if dospiral
+
+    bb = b/33
+
+    do_cube = linearstep(131, 142, b)
+
+    N = 300 
+    anm = (1 - do_cube) * linearstep(2.5,0,b-max(stabby,kick))**2
+
+    // force_big  =(b*0.125)&1  
+    force_small=((b+4)*0.25)&1
+    
+    r1 = 1*bw/1.6;
+    r2 = 1*b/16;
+    r3 = 1*b/7 //+ cube*sin01(b*0.5);
+    if(b>146 && cube==0) { do_cube *= frac(-b/2) as fx16 }
+    cube_size = 68.35 + cube*sin01(b)*5;
+    vert = (i,cube_size) => [(i & 1) ? cube_size : -cube_size, 
+                 (i & 2) ? cube_size : -cube_size, 
+                 (i & 4) ? cube_size : -cube_size]; 
+    
+    for i in 0..8
+        p1 = do3d(vert(i, cube_size), r1, r2, r3, 24, 18, 0.9, 0.01, 2.7, 0.0);
+        for k in 0..3 
+            bit = 1 << k;
+            if !(i & bit)
+                p2 = do3d(vert(i | bit, cube_size), r1, r2, r3, 24, 18, 0.9, 0.01, 2.7, 0.0);
+                line(p1[0], p1[1], p2[0], p2[1], do_cube)
+
+    if anm 
+        for i in 0..N 
+            is = 1.4*((N-i*1.0)/N)**0.5 
+            bbb  = bb*9 + is*sin(b/6)*2 //+ 
+            point(12.0 + 11*cos01(bbb   )*is, 9.0  - 7*sin01(bbb  )*is,anm,0)
+
+
+// scroll = (rhythmic_time_warp(b,0.5)*0.5) % 120
+scroll  = (bw*2) //% greetz.len
+scroll2 = (bw*2) % greetz2.len
+doscroll = dogreetz
+
+pop_target(im)
+
+for(yy=0; yy<18; yy+=2) {
+for(xx=0; xx<24; xx+=2) {
+    big=force_big
+    if !force_small
+        big = ((xx>>1) ^ (yy>>1)) & 1 ? 1 : 0//_xx > 24*(0.5+0.5*sin01(b/8)) ? 1 : 0
+
+    xoffset = 0.0
+    if doscroll
+        if yy == 4
+            big = 0; 
+        else if yy == 10
+            big = 1; 
+            xoffset = 8 - (frac(scroll) * 16) as fx16
+
+    scale = 1 + big
+    subc = 2 - big
+    for suby in 0..subc do {
+    for subx in 0..subc do {
+        x = xx + subx
+        y = yy + suby
+        if doscroll && y==5 
+            xoffset = -4 + floor((frac(scroll2) * 8) as fx16)
+        
+        // glyph(8+xx*8,11+yy*12,10,2,72)
+    
+        const gridx0 = 8  + offx
+        const gridy0 = 11 + offy
+        gray  = big ? (  image_sample(im, x     + xoffset / 16, y) 
+                       + image_sample(im, x + 1 + xoffset / 16, y) 
+                       + image_sample(im, x     + xoffset / 16, y + 1) 
+                       + image_sample(im, x + 1 + xoffset / 16, y + 1)) as i32
+                    :  image_getpixel(im, x, y) * 4
+        gray = (inv?gray>>2:gray **2 >>12)
+        if(gray > 10) {
+            ym1 = image_getpixel(im,x,y-1+big)
+            yp1 = image_getpixel(im,x,y+1+big)
+            // gray2 = 256 
+            gray2 = (256.0 * (  (1.0 - 0.610*((x - 12.1)/12.0)**2) * 
+                                (1.0 - 0.843*((y -  9.1)/9.0 )**2)   )) as i32
+            id = gray2*gray>>8 
+             //id -= id&63
+            ascii = (ym1<yp1 ? lut_a : lut_b)[id]
+            grade = 2.0*scale 
+    
+            if doscroll 
+                 greet_ch = 42 
+                 if y == 5
+                    greet_ch = greetz2[clamp(x-scroll2+greetz2.len,0,greetz2.len-1) as i32]
+                    grade *= clamp(2*id / 256.0,0,1) 
+                    ascii = greet_ch    
+                 else if yy == 10
+                    greet_ch = greetz[clamp(xx/2+scroll-13,0,greetz.len-1) as i32]
+                    grade *= clamp(2*id / 256.0,0,1) 
+                    ascii = greet_ch
+             
+            glyph(gridx0 + xoffset + 4*big+x*8, gridy0 + 6*big + y*12, 10*scale, grade, ascii, 1, 1)
+        } 
+    }
+    }
+}
+}
+
+//---- hacker, 10, 30, fix ----\\
+
+
+
+// visual \\
+
+b = beat
+// draw glyphs just to cache for later...
+glyph(138-20,16,20,4,(((b*6+1) as i32)&127) + 32 + 55) 
+glyph(138   ,16,20,4,(((b*6  ) as i32)&127) + 32 + 55) 
+glyph(138+20,16,20,4,(((b*6+1) as i32)&127) + 32) 
+glyph(138+40,16,20,4,(((b*6  ) as i32)&127) + 32) 
+glyph(138-20,36,10,2,(((b*6+1 ) as i32)&127) + 32 + 55) 
+glyph(138   ,36,10,2,(((b*6  ) as i32)&127) + 32 + 55) 
+glyph(138+20,36,10,2,(((b*6+1) as i32)&127) + 32) 
+glyph(138+40,36,10,2,(((b*6  ) as i32)&127) + 32) 
+
+background(0 );
+
+if(b>9) { return  }
+s1 = "~ $ ./pwn_pt2"
+s2 = "mounting pblFS..."
+s3 = "overflowing buffer (248b)"
+s4 = "wdt halted."
+s5 = "kernel mode enabled."
+
+s6 = "pt2-root# x/4wx $sp"
+s7 = "20004fe0:"
+s8 = "41414141 41414141"
+s9 = "41414141 0800b337"
+s10 = "Loading payload..."// "pt2-root#"
+const termx = 8 + offx
+const termy = offy - 6
+y = termy - 16*max(0,floor(b*4)-7*4)
+text_align(1)
+
+text(termx,y+16*1,10,2,s1) 
+if(b>0.5) { text(termx,y+16*2,10,2,s2)}
+if(b>2.2) { text(termx,y+16*3,10,2,s3)}
+if(b>2.5) { text(termx,y+16*4,10,2,s4)}
+if(b>2.6) { text(termx,y+16*5,10,2,s5)} 
+if(b>3)   { text(termx,y+16*7,10,2,s6)}
+if(b>3.5) { text(termx,y+16*8,10,2,s7)}
+if(b>3.5) { text(termx,y+16*9,10,2,s8)}
+if(b>3.5) { text(termx,y+16*10,10,2,s9)}
+if(b>4)   { text(termx,y+16*12,10,2,s10)}
+if(b>5) { 
+for(i=0;i<27;i++) {
+ //glyph(8 + i*7,y+16*13, 10, 2, (((i*413+(i<<2))|(b*218)) % (126-32)) + 32)
+ for(j=0;j<9;j++) {
+   k=i+j*27
+   glyph(termx + i*7,y+16*(13+j), 10, 2, ((((k*413)^(k<<2))|(b*16)) % (126-32)) + 32)
+ }
+}
+}
+text_align(0)
+
+//---- hourglass, 10, 31, fix ----\\
+
+
+
+// visual \\
+
+// #rewire f64 -> f64
+#enable lossy_assignment
+b = beat
+
+ob = b
+
+hourglass = y => (smoothstep(0,1,rsmul(abs(y),0.75))+0.15) * sqrt(max(0,1-(abs(y)-2*y*y)**4)) * 0.33
+col = (r,g,b) => b|(g<<2)|(r<<4) 
+
+colors = [
+    0
+
+    col(3,0,0)
+    col(3,1,0)
+    col(3,2,1)
+    col(3,3,2)
+    col(2,3,3)
+    col(0,2,3)
+      col(0,1,3)
+//     col(0,1,2)
+
+    0
+
+
+]
+bw = vel > 4 && (b-stabby<0.5  || vel == 126 )
+b-=212
+// if(b>24) { bw = 1 }
+smooth = 0
+smooth *= 1 - bw
+timeout = -0.4 + linearstep(16,48,b)*1.131 + smoothstep(24,50,b)*  9
+// size = (1122  + 1019.5*cos01(b/35)) as fx19
+flow = smoothstep(2,30,b)
+flow_fall = smoothstep(7,12,b)
+zoom = smoothstep(0,32,b)
+
+if vel==1 then zoom = 0.218 
+if vel==2 || vel==4
+    zoom = 0.4 + 0.4 * cos01(b/16+0.5) 
+    sync  = linearstep(0.6, 0, ob - stabby)**2
+//     timeout = -0.5 + zoom * 0.17 - sync * 0.3
+    timeout = -1
+    flow_fall = 1
+    flow = 0.8 + 0.2 * sync
+    bw = vel == 4 ? 1 : 0// :linearstep(0.5, 0, ob - stab) > 0.5
+    b = rhythmic_time_warp(b,0.5)
+
+
+if(vel==3 || vel == 5 || vel == 6 || vel == 7 || vel == 8 || vel == 9) { 
+  colorful = vel == 7 || vel == 8 || vel == 9
+//    bgcol = colors[(b*2) as int%(colors.len-2) + 1] 
+  timeout = vel == 6 || vel == 9 ?  1 : 
+            vel == 7             ? -1 : 
+                frac(b)*2-1   //(0.789 - 0.29 * linearstep(1.8, 0, ob - kick)**2 - 
+              //      0.391 * linearstep(1.8, 0, ob - stabby)**2 - 
+               //     0.85  * linearstep(1.8, 0, ob - snare)**2 ) > 0.15 ? 1 : -1  //- colorful * 10
+
+  rb = rhythmic_time_warp(b, 0.6)
+
+  zoom = 1 - sin01(rb*0.125 )/3 - (b-32)*0.035
+  
+  bw = !colorful
+  flow_fall = 0//linearstep(0.6, 0, ob - stabby)**2  
+  flow = 0.066
+//     smooth = 1
+
+}
+bgcol = bw ? 21   : col(0,0,2)
+background(bgcol);
+
+size = 2**(11.158 - 4.238*zoom)
+
+const mid_y = halfh + 0.0   
+for y in 0..height do {
+   glass_y = (y-mid_y) / size
+   xx = (hourglass(glass_y) * size ) 
+   start_x = halfw - xx
+   end_x = halfw + xx
+   prev_x = int start_x
+   flow_mul = 1.3 - 0.75*smoothstep(-0.04 ,0.2,glass_y) * flow_fall
+   if smooth
+
+      n = colors.len * 2 - 1
+      ofs = (((y & 2)*(xx as i32))>>5)
+      for c in 0..n
+          nx = (start_x + xx * 2 * (c+1) / n )  + ((c == n-1) ? 0 : ofs)
+          color = bw ? (1-(c&1)) * 63 : colors[clamp((c+(y&1))/2,0,colors.len-1) as i32]
+          pixels = int nx - prev_x
+          rect(prev_x, y, pixels, 1, color)
+          prev_x += pixels
+
+   else
+       if glass_y < timeout
+          rect(start_x, y, end_x - start_x, 1, colors[0])
+          continue
+
+//        ofs = (((1-2*(y & 1))*(xx as i32))>>4)
+       for c in 0..colors.len
+          nx = start_x + xx * 2 * (c+1) / colors.len //+ ((c == colors.len-1) ? 0 : ofs)
+          if c != colors.len - 1
+              nx = clamp(halfw + flow_mul * (nx-halfw), start_x, end_x)
+              allow_move = flow * linearstep(end_x,end_x-20,nx) * linearstep(start_x,start_x+20,nx) 
+              nx += allow_move * ( sin01(glass_y*2.0+y/240.0-b*0.35+c*1.4/colors.len)*xx*0.07 )
+
+          color = bw ? (c&1) * 63 : colors[c]
+          pixels = int nx - prev_x
+          rect(prev_x, y, pixels, 1, color)
+          prev_x += pixels
+
+       const ridge_len = 0.1
+       if glass_y >= timeout && glass_y < timeout+ridge_len
+          fy = linearstep(timeout, timeout+ridge_len, glass_y)
+          for i in start_x as int..end_x as int  // for(i = int start_x; i < int end_x; i++) {
+             fx = (i - start_x) / (end_x - start_x)
+             if (1 - 2*fx)**2 * 0.8 + 0.1 + 0.1*sin(fx*10+b*3) < 1-fy
+                 putpixel(i,y,0) 
+
+}
+// text(15,111,10,2,""+b as int,1)
+
+//---- teapot, 10, 32, fix ----\\
+
+
+
+// visual \\
+
+#enable lossy_assignment
+b = beat
+
+
+OBJ_PTS = [
+	 576983552,  576986768,  708058696, 1650725376,  576983552,  708058552,  708058696,  781471345,
+	 576999137,  576986768,  446963272,  446963128,  576986480,  708058552,  781471119,  781471345,
+	 838150799,  577055519,  576999137,  372526705,  372526479,  576998687,  781471119,  838150513,
+	 838150799,  868663968,  577160001,  577055519,  317008527,  317008241,  577054945,  838150513,
+	 868663648,  868663968,  838369935,  577274655,  577160001,  286704288,  286703968,  577159359,
+	 868663648,  838369649,  838369935,  800716411,  577369845,  577274655,  317227663,  317227377,
+	 577274081,  838369649,  800716165,  800716411,  779735663,  577360606,  577369845,  355071611,
+	 355071365,  577369355,  800716165,  779735441, 1853477487,  576983552,  576986480,  576998687,
+	 577054945,  577159359,  577274081,  577369355,  577360162, 1853477265,  576983552,  446963128,
+	 372526479,  317008241,  286703968,  317227377,  355071365,  376033681, 1651101986,  576983552,
+	 446963272,  372526705,  317008527,  286704288,  317227663,  355071611,  376033903, 1449775505,
+	 577360606, 1449775727,  577376977,  577428000,  606788112,  767169128,  577376977,  388633192,
+	 549116432,  549116400,  577427936,  606788080, 1680529936,  577428000, 1622858256,  767169128,
+	 767168920, 1680529904,  767168920,  577376559, 1651169760,  577376559,  388632984, 1622858224,
+	 388632984, 1462375016,  577434139,  577484346,  638301696,  605745664,  577434139,  550171136,
+	 516666880,  577484230,  638301696, 1651241472,  605745664,  577434085,  577484230, 1651241472,
+	 577434085, 1623912960,  577499648,  577484346,  516666880, 1651241472,  305492480,  200680960,
+	 224835144,  289804881,  305492480,  289804719,  224835000,  263690707,  263690797,  224835144,
+	 154647101,  132610560,  200680960,  224835000,  154646979,  190324186,  190324262,  154647101,
+	 120132140,  100197888,  132610560,  154646979,  120132052,  150558181,  150558235,  120132140,
+	  74048028,   65645056,  100197888,  120132052,   74047972,   87703023,   87703057,   74048028,
+	   2767377,    1715712,   65645056,   74047972,    2767343,    3820022,    3820042, 1076509201,
+	 289804881,  289870393,  263690797,  190324262,  150558235,   87703057, 1077561866,  289870393,
+	 289870279,  263690707,  190324186,  150558181,   87703023, 1077561846,  289870279, 1363546543,
+	   1715712, 1076509167,  806992384,  931769856,  930709026,  812221985,  806992384,  812221919,
+	 930708958,  928591339,  928591381,  930709026, 1035549218, 1044997632,  931769856,  930708958,
+	1035549150, 1019801067, 1019801109, 1035549218, 1056437794, 1073210880, 1044997632, 1035549150,
+	1056437726, 1029182955, 1029182997, 1056437794,  987142690,  997619200, 1073210880, 1056437726,
+	 987142622,  971429355,  971429397,  987142690,  850755101,  845501952,  997619200,  987142622,
+	 850755043,  859161069,  859161107, 1924496925,  812221985,  821635605,  928591381, 1019801109,
+	1029182997,  971429397, 1932902931,  821635605,  821635563,  928591339, 1019801067, 1029182955,
+	 971429355, 1932902893,  821635563, 1885963743,  845501952, 1924496867,
+];
+
+ OBJ_NRM = [
+	 536872457,  536874545,  580914712,  545261060,  545261052,  580914664,  580914712,  753988215,
+	 536933103,  536874545,  492834328,  492834280,  536874447,  580914664,  753987977,  753988215,
+	 938739421,  537135035,  536933103,  319877751,  319877513,  536932625,  753987977,  938738979,
+	 938739421, 1001916159,  537397247,  537135035,  135530205,  135529763,  537134149,  938738979,
+	1001915649, 1001916159,  973782768,  537575392,  537397247,   72877823,   72877313,  537396225,
+	1001915649,  973782288,  973782768,  913093327,  537703326,  537575392,  101367536,  101367056,
+	 537574432,  973782288,  913092913,  913093327,  368012706,  537881925,  537703326,  162312911,
+	 162312497,  537702498,  913092913,  368012894,  368012706,  536872439,  536874447,  536932625,
+	 537134149,  537396225,  537574432,  537702498,  537882299,  368012894,  528483836,  492834280,
+	 319877513,  135529763,   72877313,  101367056,  162312497,  707751518,  537882299,  528483844,
+	 492834328,  319877751,  135530205,   72877823,  101367536,  162312911,  707751330,  707751518,
+	 537881925,  707751330,  537898636,  537898636,  664776262,  664776262,  537898636,  411020870,
+	 411020870,  411020730,  537898356,  664776122,  664776262,  537898636,  411020870,  664776262,
+	 664776122,  664776122,  664776122,  537898356,  537898356,  537898356,  411020730,  411020730,
+	 411020730,  411020870,  537118641,  537469946, 1068048896,  991151616,  537118641,   83084800,
+	   6889984,  537468934, 1068048896,  668974592,  991151616,  537117775,  537468934,  537902467,
+	 537117775,   83084800,  537902717,  537469946,    6889984,  406830592,  274795008,  196204032,
+	 310694816,  343116669,  274795008,  343115907,  310693984,  784195843,  784196349,  310694816,
+	 275166134,   74708480,  196204032,  310693984,  275165258,  849172756,  849173228,  275166134,
+	 283604929,   43312640,   74708480,  275165258,  283604031,  923558184,  923558616,  283604929,
+	 337022929,  166870528,   43312640,  283604031,  337021999,  747540781,  747541203,  337022929,
+	 356853693,  312525312,  166870528,  337021999,  356852803,  550468942,  550469298,  356853693,
+	 343116669,  858576652,  784196349,  849173228,  923558616,  747541203,  550469298,  858576652,
+	 858576116,  784195843,  849172756,  923558184,  747540781,  550468942,  858576116,  343115907,
+	 312525312,  356852803,  547356160,  586151424,  564957091,  543980455,  547356160,  543979609,
+	 564956253,  496016708,  496017084,  564957091,  729503659,  880682496,  586151424,  564956253,
+	 729502805,  250758429,  250758883,  729503659,  817303471, 1056311808,  880682496,  729502805,
+	 817302609,   78268708,   78269148,  817303471,  724840347,  868335104, 1056311808,  817302609,
+	 724839525,  198016331,  198016693,  724840347,  684925819,  779149824,  868335104,  724839525,
+	 684925061,  263088485,  263088795,  684925819,  543980455,  537959102,  496017084,  250758883,
+	  78269148,  198016693,  263088795,  537959102,  537958722,  496016708,  250758429,   78268708,
+	 198016331,  263088485,  537958722,  543979609,  779149824,  684925061,
+];
+
+
+background(0);
+// text(100,8,10,2,''+b)
+
+sync = 0.0
+// sync  = (linearstep(0.5,0,b - snare)**2) as fx22
+sync -= linearstep(0.5,0,b - kick)**2  *0.6
+sync -= linearstep(0.8,0,b - stabby) *0.5 
+
+fov = 2.28 + sync
+obj_scale = 0.9 - sin01(b/12)*0.2//+ rhythmic_time_warp(b,0.77,0.0953) - b
+rotx = mix(0.0, 1.51, linearstep(100,116,b))
+roty = rhythmic_time_warp((b+1)*0.51,0.584 * smoothstep(112,109,b),0.142)
+rotz = mix(0.0, 0.681, linearstep(100,116,b))
+
+const HALF = 512.0;            // zero
+const INV = 1.0 / 511;         // units -> -1..1
+
+//const W = width + 0.0;
+//const H = height + 1.0;
+
+pv = [0.0, 0.0, 0.0];
+nv = [0.0, 0.0, 0.0];
+
+unpack = (word, out:[]fx16) => 
+    out[0] =  (( (word      ) & 1023) - HALF) * INV;
+    out[1] = -((((word >> 10) & 1023) - HALF) * INV);
+    out[2] =  (( (word >> 20) & 1023) - HALF) * INV;
+    return (word >> 30) & 1;
+
+
+eyez = -fov / obj_scale;
+drawn = 0;
+live = 0;            
+ax = 0.0; 
+ay = 0.0;     
+af = 0.0;         
+ashade = 0.0
+
+
+for i in 0..OBJ_PTS.length
+    last = unpack(OBJ_PTS[i], pv);
+    unpack(OBJ_NRM[i], nv);
+    
+    s = do3d(pv, roty, rotx, rotz, proj_w, proj_h, proj_aspect, obj_scale, fov);
+    
+    rot(nv, 0, 2, roty); 
+    rot(nv, 1, 2, rotx); 
+    rot(nv, 0, 1, rotz);
+    face = 1//faces(nv, pv, eyez);
+    dot = nv[0] * -pv[0] + nv[1] * -pv[1] + nv[2] * (eyez - pv[2])
+    shade = smoothstep(-2.3,1,dot) * 0.5
+    face = shade > 0.1 
+    
+    
+    if live && (face || af)
+        dx = s[0] - ax, dy = s[1] - ay;
+        //line(ax, ay, s[0], s[1], shade+ashade);
+        if sync == 0
+            line(ax, ay, s[0], s[1], shade+ashade,1,0);
+        else
+            line(ax+sync*20, ay, s[0]+sync*20, s[1], shade+ashade,1,2|4)
+            line(ax+sync*07, ay, s[0]+sync*07, s[1], shade+ashade,1,2|8)
+            line(ax-sync*15, ay, s[0]-sync*15, s[1], shade+ashade,1,4|8)
+
+    live = last ? 0 : 1;
+    ax = s[0]; ay = s[1]; af = face; ashade = shade
+
+ 
+	
+// rect(30,30,10,10,63)
+
+//---- black, 10, 33, fix, order=-1 ----\\
+
+
+
+// visual \\
+
+background(vel-1);
+

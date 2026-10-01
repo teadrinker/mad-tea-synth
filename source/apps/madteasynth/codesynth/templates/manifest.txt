@@ -1,0 +1,95 @@
+# Project-export template manifest:
+#   dest-path-in-exported-project | source-path-from-repo-root | targets
+# Targets: pebble, win32, microw8, wav (both wav targets), or `all`. Flags in
+# the same column:
+#   nofollow   don't walk this file's #includes
+#   binary     carry byte for byte (no LF normalisation or include rewrite);
+#              implies nofollow, excludes subst
+#   subst      fill `{{NAME}}` placeholders at export time (ExportTemplateVar);
+#              a subst entry with no placeholder is an error
+# Only entry points go here: gen_template_embed.py walks the include graph, and
+# a discovered file's mask is the union of its includers'. Discovered files keep
+# their repo layout under src/c; only the shims' `../../../` includes are
+# rewritten.
+
+# ---- pebble emery ----
+# teatime's src/c holds one-line shims onto these.
+src/c/pebble_tsys.c                        | apps/madteasynth/codesynth/templates/pebble/pebble_tsys.c                  | pebble
+src/c/pebble_tsys.h                        | apps/madteasynth/codesynth/templates/pebble/pebble_tsys.h                  | pebble
+src/c/math_stubs.c                         | apps/madteasynth/codesynth/templates/pebble/math_stubs.c                   | pebble
+src/c/teatime_log.h                        | apps/madteasynth/codesynth/templates/pebble/teatime_log.h                  | pebble
+src/c/svf.h                                | apps/madteasynth/codesynth/templates/pebble/svf.h                          | pebble
+src/c/song/vscreen.h                       | apps/madteasynth/codesynth/templates/pebble/song/vscreen.h                 | pebble
+
+# One-line shims for waf's src/c/**/*.c glob and the fonts' short names; each
+# project carries its own.
+src/c/render_ctx_pebble.c                  | apps/madteasynth/codesynth/templates/pebble/render_ctx_pebble.c            | pebble
+src/c/font_digits_lowspec.h                | apps/madteasynth/codesynth/templates/pebble/font_digits_lowspec.h          | pebble
+src/c/font_idealist_hacker_mono_lowspec.h  | apps/madteasynth/codesynth/templates/pebble/font_idealist_hacker_mono_lowspec.h | pebble
+
+# Low-memory sizing of the glyph pipeline, shared with microw8.
+src/c/font/render_lowspec_lowmem.c         | font/render_lowspec_lowmem.c                       | pebble microw8
+
+# Compiled directly, so the walk can't find it. Not listed: arena.c, array.c,
+# tiny_lz.c (VM and meld only) and math_pure.c (covered by inline code and
+# math_stubs.c).
+src/c/common/math_fixedp.c                 | common/math_fixedp.c                               | pebble
+
+# `nofollow`: its includes don't resolve from the exporter's tree, and every
+# header it names is reached through the entries above.
+src/c/main.c                               | apps/madteasynth/codesynth/templates/pebble/main.c | pebble nofollow
+
+# Speaker EQ constants, included by the generated song_config.h; they belong to
+# this target.
+src/c/speaker_eq.h                         | apps/madteasynth/codesynth/templates/pebble/speaker_eq.h | pebble nofollow
+
+# The menu icon, from teatime. `resources/` and the name must match
+# PebblePackageJson in ExportProject.cpp. Resources don't count against the
+# 64 KB cap.
+resources/cup icon 25x25.png               | teatime/resources/cup icon 25x25.png                             | pebble binary
+
+# Build files: project root, `nofollow` since they are not C.
+wscript                                    | apps/madteasynth/codesynth/templates/pebble/wscript              | pebble nofollow
+README.md                                  | apps/madteasynth/codesynth/templates/pebble/README.md            | pebble nofollow
+build_and_install.bat                      | apps/madteasynth/codesynth/templates/pebble/build_and_install.bat | pebble nofollow
+
+# ---- win32 ----
+# The desktop vscreen binding, reused verbatim; its arena sizes are
+# overridable, which lets microw8 share it.
+src/c/main.c                               | apps/madteasynth/codesynth/templates/win32/main.c   | win32 nofollow
+# `subst` for {{SLUG}}, the .exe's name.
+build.bat                                  | apps/madteasynth/codesynth/templates/win32/build.bat | win32 nofollow subst
+# Static prose, no `subst`.
+README.md                                  | apps/madteasynth/codesynth/templates/win32/README.md | win32 nofollow
+src/c/vscreen.c                            | apps/madteasynth/vscreen.c                          | win32 microw8 wav
+src/c/vscreen.h                            | apps/madteasynth/vscreen.h                          | win32 microw8 wav
+src/c/crt_stub_win32.c                     | platform/crt_stub_win32.c                           | win32
+
+# ---- microw8 ----
+# font_lowspec_pebble.c is the low-memory glyph sizing (POLY_MAX_EDGES 243),
+# which a 256 KB cart needs too.
+src/c/cart.c                               | apps/madteasynth/codesynth/templates/microw8/cart.c         | microw8 nofollow
+src/c/tiny_runtime.c                       | apps/madteasynth/codesynth/templates/common/tiny_runtime.c  | microw8 win32 nofollow
+# `subst` for {{SLUG}}, the cart's name, as is run.bat.
+build.bat                                  | apps/madteasynth/codesynth/templates/microw8/build.bat      | microw8 nofollow subst
+# Static prose: where to get uw8.exe and wasm-opt.exe.
+README.md                                  | apps/madteasynth/codesynth/templates/microw8/README.md      | microw8 nofollow
+# `pause` keeps a load failure on screen.
+run.bat                                    | apps/madteasynth/codesynth/templates/microw8/run.bat        | microw8 nofollow subst
+
+# ---- wav ----
+# The offline renderer, shared with the in-tree render_song.bat. `nofollow`: it
+# reaches song.c as <song.c> via -I.
+src/c/render_song.c                        | apps/madteasynth/codesynth/render_song.c                    | wav nofollow
+# `subst` for {{SLUG}}.
+build.bat                                  | apps/madteasynth/codesynth/templates/wav/build.bat          | wav nofollow subst
+README.md                                  | apps/madteasynth/codesynth/templates/wav/README.md          | wav nofollow
+
+# ---- files a target compiles directly ----
+# The walk only finds #includes, so .c files a build.bat names go here. win32
+# compiles the renderer at desktop sizing; pebble and microw8 reach it through
+# the low-memory shims, so win32's build.bat must not compile those.
+src/c/font/render_lowspec.c                | font/render_lowspec.c                               | win32 wav
+src/c/font/render_ctx.c                    | font/render_ctx.c                                  | win32 microw8 wav
+src/c/common/math_pure.c                   | common/math_pure.c                                 | win32 microw8 wav
+src/c/common/math_fixedp.c                 | common/math_fixedp.c                               | win32 microw8 wav

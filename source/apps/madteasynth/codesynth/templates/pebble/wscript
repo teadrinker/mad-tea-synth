@@ -1,0 +1,217 @@
+#
+# Build rules for an exported codesynth song (Pebble / emery).
+#
+# GENERATED PROJECT -- this file is a template shipped by the exporter, not
+# something derived from your song. Editing it is fine; re-exporting over this
+# directory will replace it.
+#
+import os
+import zipfile
+
+
+top = '.'
+out = 'build'
+
+
+def _compress_pbw(ctx):
+    """Rewrite the finished .pbw with DEFLATE instead of STORE.
+
+    The SDK's mkbundle.py opens the bundle as zipfile.ZipFile(out_path, "w")
+    with no compression argument, which is ZIP_STORED -- every byte of the .pbw
+    is the raw file. That is most of the bundle's size: the app binary is ARM
+    code (deflates ~40%) and app_resources.pbpack is almost entirely zeros --
+    a 12-byte manifest, then 255 fixed-size table entries of which this project
+    uses one (the menu icon), then the icon itself. 4387 bytes, ~300 of them
+    real.
+
+    NOT a size lever for the 64 KB virtual-size cap -- nothing in the .pbw is,
+    except pebble-app.bin, and only via its uncompressed text+data+bss. This is
+    purely bytes-over-the-air: a smaller bundle is a faster `pebble install`.
+
+    Set SONG_PBW_STORE=1 to skip this and get the stock stored bundle back if an
+    install ever fails -- no stock SDK build has ever produced a compressed .pbw,
+    so the phone app's unzip path has never seen one. It is an ordinary zip and
+    every standard reader handles DEFLATE, but that is an assumption about
+    someone else's code rather than something this project can verify.
+    """
+    if os.environ.get('SONG_PBW_STORE') == '1':
+        return
+    pbw = os.path.join(ctx.path.get_bld().abspath(), ctx.env.BUNDLE_NAME)
+    if not os.path.exists(pbw):
+        return
+
+    with zipfile.ZipFile(pbw, 'r') as z:
+        entries = [(i, z.read(i.filename)) for i in z.infolist()]
+        if all(i.compress_type == zipfile.ZIP_DEFLATED for i, _ in entries):
+            return  # already compressed (incremental build)
+
+    before = os.path.getsize(pbw)
+    tmp = pbw + '.tmp'
+    with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        for info, data in entries:
+            # Carry the original date_time across; a fresh ZipInfo would stamp
+            # the entries with "now" and make the bundle non-reproducible.
+            out_info = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+            out_info.compress_type = zipfile.ZIP_DEFLATED
+            out_info.external_attr = info.external_attr
+            z.writestr(out_info, data)
+    os.replace(tmp, pbw)
+
+    from waflib import Logs
+    Logs.pprint('CYAN', 'Compressed {}: {} -> {} bytes'.format(
+        ctx.env.BUNDLE_NAME, before, os.path.getsize(pbw)))
+
+
+def options(ctx):
+    ctx.load('pebble_sdk')
+
+
+def configure(ctx):
+    ctx.load('pebble_sdk')
+
+
+def build(ctx):
+    ctx.load('pebble_sdk')
+
+    # ---- resources ---------------------------------------------------------
+    # Nothing to do here, and that is worth stating rather than leaving as an
+    # absence: pbl_bundle picks the menu icon up from package.json's
+    # `resources.media` and the `resources/` directory next to this file, both
+    # of which the exporter writes. It never reaches the app image -- resources
+    # are packed into app_resources.pbpack, which is flash the firmware reads,
+    # so the icon costs the 64 KB virtual-size cap below exactly zero (measured:
+    # 65,050-byte RAM footprint with and without it).
+
+    # ---- feature defines ---------------------------------------------------
+    #
+    # TEATIME_SYNTH_VISUALS wires the song's generated *_visual bodies onto the
+    # screen while it plays. SONG_NO_VISUALS=1 drops it for an audio-only build:
+    # the whole drawing half of main.c compiles out, and the generated song.c's
+    # visual bodies -- which are compiled unconditionally -- are then removed at
+    # LINK time, because the SDK builds -ffunction-sections -fdata-sections and
+    # links --gc-sections, and nothing calls song_visual_render any more. The
+    # vscreen_* symbols those bodies reference are left undefined on purpose:
+    # ld does not resolve relocations in sections it has already discarded.
+    #
+    # (The name still says TEATIME because main.c is extracted verbatim from the
+    # app this exporter grew out of, and keeping the spelling identical is what
+    # makes the two provably equivalent.)
+    #
+    # FX16_DIV_OUTOFLINE makes fx16_div a real function instead of a macro that
+    # widens to int64 at every use. Bit-identical results; it stops ~12 bytes of
+    # operand setup being duplicated at each of the 60+ divide sites. Worth 284
+    # bytes in a non-LTO build and measured at exactly ZERO under LTO, which
+    # inlines it straight back across the TU boundary.
+    #
+    # FX16_DIV_FAST32 then changes what that function DOES: it builds the
+    # (a << 16) / b quotient out of four 32-bit divides by long division instead
+    # of handing the whole thing to libgcc's generic 64/64 bit-at-a-time
+    # __aeabi_ldivmod. Exact, not approximate, and it falls back to the int64
+    # form for operand ranges where it could not be.
+    defines = ['FX16_DIV_OUTOFLINE', 'FX16_DIV_FAST32']
+    if os.environ.get('SONG_NO_VISUALS') != '1':
+        defines.append('TEATIME_SYNTH_VISUALS')
+
+    # Ad-hoc defines for a measurement build, so diagnostics can be switched on
+    # without editing this file: SONG_DEFINES='PEBBLE_SYNC_DEBUG=1'.
+    defines += [d for d in os.environ.get('SONG_DEFINES', '').replace(',', ' ').split() if d]
+
+    binaries = []
+    cached_env = ctx.env
+    for platform in ctx.env.TARGET_PLATFORMS:
+        ctx.env = ctx.all_envs[platform]
+        ctx.set_group(ctx.env.PLATFORM_NAME)
+        ctx.env.append_unique('DEFINES', defines)
+
+        # ---- CPU model -----------------------------------------------------
+        # The SDK compiles emery with -mcpu=cortex-m3, which is the ORIGINAL
+        # emery silicon, not the part this runs on. GCC honours the LAST
+        # -mcpu/-mtune on the command line, so this is a plain append and
+        # dropping it restores the stock build exactly.
+        #
+        # It matters because Cortex-M3 takes 3-5 cycles for UMULL/SMULL where
+        # M4/M33 take 1, and this code is fixed-point everywhere -- the codesynth
+        # emitter writes every multiply as (long long)a * (long long)b >> n. The
+        # cortex-m3 cost model is not just scheduling for the wrong part, it may
+        # be CHOOSING worse code to dodge an operation that is free.
+        #
+        # DEFAULT is -mtune only: same ISA, still ARMv7-M, so it can only change
+        # instruction selection and scheduling, never emit something the
+        # hardware cannot execute.
+        #
+        # SONG_CPU=m33 switches to the ARMv8-M Mainline ISA proper, which DOES
+        # emit instructions a Cortex-M3 would fault on. Opt-in, because being
+        # wrong about the silicon shows up as an undefined-instruction fault
+        # mid-song rather than as a build error.
+        #
+        # +nofp is NOT optional and must never be dropped. With the FPU enabled
+        # GCC will allocate s0-s31; whether the firmware enables CPACR for app
+        # tasks and saves those registers across a context switch is firmware
+        # behaviour that cannot be observed from here. If it does not, the
+        # corruption is silent and intermittent and will look like a renderer
+        # bug. Nothing here needs float -- it is fixed-point end to end.
+        if os.environ.get('SONG_CPU') == 'm33':
+            cpu_flags = ['-mcpu=cortex-m33+nofp', '-mfloat-abi=soft']
+        else:
+            cpu_flags = ['-mtune=cortex-m33']
+        ctx.env.append_unique('CFLAGS', cpu_flags)
+        ctx.env.append_unique('LINKFLAGS', cpu_flags)
+
+        # ---- link-time optimization, ON by default -------------------------
+        #
+        # NOT a tuning choice. Measured on the song this exporter was built
+        # against, emery, text+data+bss against the 65,535-byte virtual-size cap
+        # that inject_metadata.py's uint16 header field imposes:
+        #
+        #     release, no LTO    67,420   -- OVER CAP, fails at inject_metadata
+        #     release + LTO      64,371   -- fits, ~1.1 KB spare
+        #
+        # So with visuals on, LTO is the only configuration that installs.
+        # SONG_NO_LTO=1 exists to A/B a suspected LTO miscompile, not as a
+        # normal build -- expect it to fail the cap unless the song is small or
+        # SONG_NO_VISUALS=1 is also set.
+        #
+        # -u __pbl_app_info is NOT optional. That symbol (appinfo.auto.c,
+        # section .pbl_header, placed at address 0 by the linker script) is
+        # referenced only BY the linker script, never from C -- so LTO's
+        # whole-program pass concludes it is dead and drops it. The build then
+        # still "succeeds": .header vanishes, .note.gnu.build-id slides up to
+        # address 0, and inject_metadata.py -- which writes load/virtual size at
+        # fixed offsets 0x00/0x80 -- scribbles them into the build-id note
+        # instead. What you get is a .pbw whose first bytes are "\x04\0\0\0...GNU"
+        # where the firmware expects "PBLAPP", with nothing anywhere saying so.
+        #
+        # build_and_install.bat checks that magic before it installs. Keep that
+        # check in step with this block.
+        if os.environ.get('SONG_NO_LTO') != '1':
+            ctx.env.append_unique('CFLAGS', ['-flto'])
+            ctx.env.append_unique('LINKFLAGS', ['-flto', '-Os', '-Wl,-u,__pbl_app_info'])
+
+        ctx.env.append_unique('INCLUDES', [
+            ctx.path.abspath() + '/src/c',
+            ctx.path.abspath() + '/build/include',
+        ])
+
+        # font/render_lowspec.c, font/render_ctx.c and common/math_pure.c are
+        # #included by shim TUs (font_lowspec_pebble.c, render_ctx_pebble.c)
+        # that set sizing macros first, so they must NOT also be compiled on
+        # their own -- that would be two copies of every symbol. common/
+        # math_fixedp.c is the exception: nothing #includes it, so it is
+        # compiled directly and stays in the glob.
+        sources = ctx.path.ant_glob('src/c/**/*.c',
+                                    excl=['src/c/font/render_lowspec.c',
+                                          'src/c/font/render_ctx.c',
+                                          'src/c/common/math_pure.c'])
+
+        app_elf = '{}/pebble-app.elf'.format(ctx.env.BUILD_DIR)
+        ctx.pbl_build(source=sources, target=app_elf, bin_type='app')
+        binaries.append({'platform': platform, 'app_elf': app_elf})
+    ctx.env = cached_env
+
+    ctx.set_group('bundle')
+    # No js= : nothing in this app talks to the phone, so the bundle ships no
+    # JavaScript at all. pbl_bundle's js= is optional and messageKeys are
+    # unaffected (those come from package.json).
+    ctx.pbl_bundle(binaries=binaries)
+
+    ctx.add_post_fun(_compress_pbw)
