@@ -19,6 +19,8 @@ static IGraphics* g_graphics = nullptr;
 static HWND       g_ghostWnd = nullptr;
 static HWND       g_mainWnd  = nullptr;
 static HHOOK      g_keyboardHook = nullptr;
+static bool       g_editorFocused = false;
+static bool       g_captureEscape = false;
 
 // ---- ghost Edit-control focus ----
 
@@ -107,6 +109,14 @@ static bool PluginWindowHasOsFocus() {
   return g_mainWnd && IsChild(g_mainWnd, focused);
 }
 
+// Also counts the host's frame around the view, e.g. REAPER's FX window, which
+// keeps focus until the view is clicked and closes itself on Escape.
+static bool PluginWindowOrFrameHasOsFocus() {
+  if (PluginWindowHasOsFocus()) return true;
+  HWND focused = GetFocus();
+  return focused && IsChild(focused, g_mainWnd);
+}
+
 extern "C" int PlatformKeyFocus_WindowHasOsFocus(void) {
   return PluginWindowHasOsFocus() ? 1 : 0;
 }
@@ -116,7 +126,16 @@ static LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam
     const bool isKeyUp   = (lParam & (1 << 31)) != 0;
     const bool ctrlDown  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
 
-    if (IsInterceptedShortcut(wParam, ctrlDown) && PluginWindowHasOsFocus()) {
+    if (g_captureEscape && wParam == VK_ESCAPE && PluginWindowOrFrameHasOsFocus()) {
+      IKeyPress keyPress{ "", VK_ESCAPE, false, false, false };
+      if (isKeyUp)
+        g_graphics->OnKeyUp(0.f, 0.f, keyPress);
+      else
+        g_graphics->OnKeyDown(0.f, 0.f, keyPress);
+      return 1;
+    }
+
+    if (g_editorFocused && IsInterceptedShortcut(wParam, ctrlDown) && PluginWindowHasOsFocus()) {
       char str[2] = { (char)wParam, '\0' };
       IKeyPress keyPress{ str, (int)wParam,
                           (bool)(GetKeyState(VK_SHIFT) & 0x8000),
@@ -142,7 +161,7 @@ static void InstallKeyboardHook() {
 }
 
 static void RemoveKeyboardHook() {
-  if (!g_keyboardHook) return;
+  if (!g_keyboardHook || g_editorFocused || g_captureEscape) return;
   UnhookWindowsHookEx(g_keyboardHook);
   g_keyboardHook = nullptr;
 }
@@ -150,13 +169,22 @@ static void RemoveKeyboardHook() {
 extern "C" void PlatformKeyFocus_SetGraphics(void* graphics) {
   // Null means the control is going away: tear down the window and the hook.
   if (!graphics) {
+    g_editorFocused = g_captureEscape = false;
     RemoveKeyboardHook();
     DestroyGhostWindow();
   }
   g_graphics = (IGraphics*)graphics;
 }
 
+// While on, Escape goes to the view even when the host would act on it.
+extern "C" void PlatformKeyFocus_SetCaptureEscape(int on) {
+  g_captureEscape = on != 0;
+  if (on) InstallKeyboardHook();
+  else    RemoveKeyboardHook();
+}
+
 extern "C" void PlatformKeyFocus_SetEditorFocused(int focused) {
+  g_editorFocused = focused != 0;
   if (focused) {
     EnsureGhostWindow();
     if (g_ghostWnd) SetFocus(g_ghostWnd);
@@ -172,6 +200,7 @@ extern "C" void PlatformKeyFocus_SetEditorFocused(int focused) {
 
 extern "C" void PlatformKeyFocus_SetGraphics(void* /* graphics */) {}
 extern "C" void PlatformKeyFocus_SetEditorFocused(int /* focused */) {}
+extern "C" void PlatformKeyFocus_SetCaptureEscape(int /* on */) {}
 extern "C" int  PlatformKeyFocus_WindowHasOsFocus(void) { return 1; }
 
 #endif

@@ -24,10 +24,16 @@
 // origin, and may extend past the tile being drawn.
 // ===================================================================
 
+struct RLayout;
+
+// `layout` says what a byte means (common/render_layout.h). 0 is this TU's
+// native encoding: GColor8 under RS_PEBBLE_TIME2 (which ignores the field),
+// else 8-bit gray. Initialise it when filling the struct field by field.
 typedef struct {
     unsigned char *pixels;
     int stride;
     int clip_x, clip_y, clip_w, clip_h;
+    const struct RLayout *layout;
 } RSurface;
 
 // ===================================================================
@@ -76,9 +82,9 @@ static inline unsigned char rs_px_of(int gray) {
 //   bits 0-15   the compositing MODE, itself a set of BITS (BLEND_*, below):
 //                 1  BLEND_INVERT  lift each pixel toward its own inverse
 //                                  instead of toward white / toward `col`
-//                 2  BLEND_LOCK_R  leave the destination's red alone
-//                 4  BLEND_LOCK_G  leave its green alone
-//                 8  BLEND_LOCK_B  leave its blue alone
+//                 2  BLEND_LOCK_CH0  leave the low channel alone (blue)
+//                 4  BLEND_LOCK_CH1  leave the mid channel alone (green)
+//                 8  BLEND_LOCK_CH2  leave the high channel alone (red)
 //                 16 BLEND_REPLACE store, don't blend (triangle backend only)
 //               0 is plain screen, which is what it always was. Read them with
 //               rs_blend_inverted() / rs_blend_chanmask(), never by comparing
@@ -86,12 +92,11 @@ static inline unsigned char rs_px_of(int gray) {
 //               any other bit rides along.
 //   bit 16      BLEND_8BIT_GRAYSCALE, below.
 //
-// The lock bits live down here, in the low nibble, for one reason: this is the
-// only part of `blend` a codesynth script can reach. Every draw builtin takes
-// its arguments as Q16.16 and render_ctx shifts `blend` back down, so a value
-// only survives the round trip if it fits a small integer -- BLEND_CHANNEL's
-// bits 17-22 (which say the same thing, positively) do not. So a script asks
-// for "red only" as blend = BLEND_LOCK_G | BLEND_LOCK_B == 4 | 8.
+// The lock bits live down here, in the low nibble, because this is the only
+// part of `blend` a codesynth script can reach (draw builtins take Q16.16 and
+// render_ctx shifts `blend` back down). Channels count from the low bits, as
+// in the byte and in color_ramp_setup, so on GColor8 "red only" is
+// BLEND_LOCK_CH0 | BLEND_LOCK_CH1 == 2 | 4.
 //
 // The mode is read SIGNED, but every rasterizer here only ever sees a
 // non-negative one. The sign is spare capacity that one public API layer above
@@ -118,36 +123,17 @@ static inline unsigned char rs_px_of(int gray) {
 // The mode-field bits. 0 -- no bit set -- is screen over every channel, which
 // is what a caller that never heard of any of this passes and always did.
 #define BLEND_INVERT   1
-#define BLEND_LOCK_R   2
-#define BLEND_LOCK_G   4
-#define BLEND_LOCK_B   8
-#define BLEND_LOCK_BITS (BLEND_LOCK_R | BLEND_LOCK_G | BLEND_LOCK_B)
+#define BLEND_LOCK_CH0 2
+#define BLEND_LOCK_CH1 4
+#define BLEND_LOCK_CH2 8
+#define BLEND_LOCK_BITS (BLEND_LOCK_CH0 | BLEND_LOCK_CH1 | BLEND_LOCK_CH2)
+#define BLEND_LOCK_B   BLEND_LOCK_CH0
+#define BLEND_LOCK_G   BLEND_LOCK_CH1
+#define BLEND_LOCK_R   BLEND_LOCK_CH2
 // Store the source instead of blending it. Only render_triangle.h implements
 // this; it lives here because it is a mode-field bit like the rest, and having
 // it here is what keeps it from colliding with the locks.
 #define BLEND_REPLACE  16
-
-// Channel write mask, bits 17-22: which of the destination byte's three 2-bit
-// RGB channels this draw may modify, as RRGGBB (bit 5..4 red, 3..2 green,
-// 1..0 blue -- the same bit positions they occupy in a GColor8 pixel).
-//
-// This is the POSITIVE form of the same control the BLEND_LOCK_* bits express
-// negatively, and the two intersect: the locks subtract from whatever this
-// field selects, so BLEND_CHANNEL(0x3F) | BLEND_LOCK_R and a bare
-// BLEND_LOCK_R mean the same thing. It exists because "which channels" is
-// naturally a mask, and the locks exist because only the low nibble survives
-// the trip through a codesynth script (see the note above).
-//
-// 0 here means "every channel", so a caller that never heard of masking passes
-// the bare mode exactly as before and keeps its meaning -- the same convention
-// BLEND_8BIT_GRAYSCALE established one bit lower.
-//
-// Only the unified blend path (USE_UNIFIED_BLEND, common/render_blend.h)
-// honours any of this. On the legacy path it is silently ignored, which
-// degrades to today's behaviour rather than to something wrong.
-#define BLEND_CHANNEL_SHIFT  17
-#define BLEND_CHANNEL_BITS   0x7E0000
-#define BLEND_CHANNEL(m)     (((m) & 0x3F) << BLEND_CHANNEL_SHIFT)
 
 // The mode field as a magnitude, which is the only form its bits can be read
 // out of: a bare negative mode (-1 and friends -- the backend-selecting sign
@@ -165,16 +151,12 @@ static inline int rs_blend_inverted(int blend) {
     return (rs_blend_flags(blend) & BLEND_INVERT) != 0;
 }
 
-// The destination byte-mask this draw may write, as a GColor8 AARRGGBB byte.
-// 0xFF -- the whole byte, the historical behaviour -- unless a channel was
-// masked out, either by BLEND_CHANNEL selecting a subset or by a BLEND_LOCK_*
-// bit removing one. The two alpha bits are always writable: they are not a
-// colour channel, and leaving them to come from the destination would let a
-// masked draw land transparent on a buffer that was never initialized opaque.
+// The GColor8 byte-mask this draw may write: 0xFF unless a BLEND_LOCK_* bit
+// removed a channel. The two alpha bits stay writable, so a masked draw cannot
+// land transparent on a buffer that was never initialized opaque.
 static inline int rs_blend_chanmask(int blend) {
-    int m    = (blend & BLEND_CHANNEL_BITS) >> BLEND_CHANNEL_SHIFT;
+    int m    = 0x3F;
     int lock = rs_blend_flags(blend) & BLEND_LOCK_BITS;
-    if (!m) m = 0x3F;
     if (lock & BLEND_LOCK_R) m &= ~0x30;
     if (lock & BLEND_LOCK_G) m &= ~0x0C;
     if (lock & BLEND_LOCK_B) m &= ~0x03;
@@ -261,6 +243,7 @@ static inline RSurface rs_tile(unsigned char *pixels, int w, int h) {
     s.clip_y = 0;
     s.clip_w = w;
     s.clip_h = h;
+    s.layout = 0;
     return s;
 }
 

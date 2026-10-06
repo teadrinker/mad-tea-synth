@@ -75,8 +75,9 @@ set "SRC=src/c/cart.c src/c/vscreen.c src/c/tiny_runtime.c src/c/song/song.c src
 :: below 0x14000. --global-base=81920 puts our data just above them. Those
 :: numbers are the platform's, not ours -- do not tune them.
 ::
-:: RS_PEBBLE_TIME2=1 makes render_lowspec's aaline blend in GColor8 space, which
-:: is the pixel format vscreen uses and the one the palette is built for.
+:: RS_PEBBLE_TIME2=0 overrides render_lowspec_lowmem.c's Pebble default, so the
+:: renderer blends through the screen's runtime layout (GColor8 until the song
+:: calls color_ramp_setup).
 ::
 :: Turning OFF bulk-memory is NOT optional with a current clang (21 enables it
 :: by default). With it on, memset/memcpy lower to memory.fill/memory.copy and
@@ -108,7 +109,7 @@ clang -O2 --target=wasm32 ^
     -Xclang -target-feature -Xclang -bulk-memory ^
     -Xclang -target-feature -Xclang -bulk-memory-opt ^
     -Xclang -target-feature -Xclang +nontrapping-fptoint ^
-    -DRS_PEBBLE_TIME2=1 ^
+    -DRS_PEBBLE_TIME2=0 ^
     -Isrc/c -include src/c/song_config.h ^
     -Wl,--no-entry,--import-memory,--initial-memory=262144,--global-base=81920,-zstack-size=4096 ^
     -o "%WASM%" %SRC%

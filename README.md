@@ -2,7 +2,7 @@
 
 A MIDI instrument plugin where sound and visuals are code-driven. (platform: vst3, Windows x64, only tested in Reaper)
 
-Read [short introduction here](https://teadrinker.net/blog/what-time-is-it.html#mad-tea-synth), or read about [journey making it](https://teadrinker.net/blog/mad-tea-synth.html) 
+Read [short introduction here](https://teadrinker.net/blog/what-time-is-it.html#mad-tea-synth), or read about [the journey making it](https://teadrinker.net/blog/mad-tea-synth.html) 
 
 ### Warning - alpha version - this is software is not stable!
 

@@ -12,6 +12,8 @@
 #include "codesynth/SongSeq.h"
 
 struct RenderCtx;  // opaque; see ScreenCtx()
+struct CodeSynthProbes;
+struct CodeSynthInspectListener;
 class cCodeSynth;
 class cINDEXYNT;
 class cTDAudioPluginBase;
@@ -115,6 +117,13 @@ public:
   // the open entry with. UI thread only.
   bool CodeSynthLastVoiceArgs(double* out) const;
 
+  // Inspection of the open entry's visual body, UI thread only: probes compiled
+  // into the visual pipeline (a change recompiles that half alone), the editor
+  // text their spans are in, and where the readings go.
+  void SetCodeSynthVisualProbes(const CodeSynthProbes& probes);
+  void SetCodeSynthVisualProbeBody(const std::string& editorBody);
+  void SetCodeSynthInspectListener(const CodeSynthInspectListener& listener);
+
   const std::vector<CodeSynthEntry>& Entries() const { return mEntries; }
   int EntryCount() const { return (int)mEntries.size(); }
   // A default entry when idx is out of range.
@@ -141,6 +150,8 @@ public:
   // Refuses the prelude blocks.
   bool DeleteCodeSynthEntry(int idx);
   void PushCodeSynthLiveEdit();
+  // Recompiles keep the globals' running values; this puts back the initial ones.
+  void ResetCodeSynthGlobals();
 
   // The path is always live: Load/Save, exports and WAV directives use it.
   // FileIsMaster only governs automatic pulls on UiIdle. Setting either re-reads a
@@ -163,6 +174,8 @@ public:
 
   // The entry the screen shows while no visual voice plays; idx < 0 = none.
   void SetVisualPreviewEntry(int idx);
+  // Whether idx's visual body was drawn in the last visual tick. UI thread only.
+  bool EntryVisuallyRendered(int idx) const;
 
   static const int kBlockSize = 32; // VSTPLUGIN_FORCEBLOCKSIZE
 

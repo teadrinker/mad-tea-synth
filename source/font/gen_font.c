@@ -4,6 +4,13 @@
 #include "font_assembly_line.h"
 #include "font_idealist_hacker_mono.h"
 
+const char *const gen_font_names[GEN_FONT_COUNT] = { "Assembly", "Hacker" };
+
+void get_font_by_index(Tsys *sys, int index, FONT_SETTINGS *dst) {
+    if (index == 1) get_font_idealist_hacker_mono(sys, dst);
+    else            get_font_assembly_line(sys, dst);
+}
+
 
 #if 0
 

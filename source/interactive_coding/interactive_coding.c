@@ -15,6 +15,7 @@
 #include "common/token_iterator.h"
 #include "common/string_pure.h"
 #include "common/math_pure.h"
+#include "platform/platform.h"
 
 
 
@@ -42,24 +43,35 @@ static float ic_draw_cell_override(void *user, UIContext *ui, UITextArea *ta,
                                     float sx, float sy,
                                     unsigned char ch, unsigned int color, unsigned int flags);
 static void ic_on_content_updated(void *user, UITextArea *ta);
+static void ic_on_insert_text(void *user, UITextArea *ta, int row, int col, int length);
+static void ic_complete_forget_editor(InteractiveCoding *ic, ICEditor *ed);
+static void ic_complete_release(InteractiveCoding *ic);
 
 static const char *k_default_code =
-    "// Hover to inspect, right-click to pin\n"
-    "// Right-click + drag to adjust values\n"
-    "// Right-click gutter to comment / uncomment\n"
-    "\n"
-    "1 + 2f + 3.0 + 3e4 // hello there\n"
-    "\n"
-    "x = 10; y = 32; /* hi */ x + y\n"
-    "\n"
-    "sq = x => x * x\n"
-    "sq(6)\n"
-    "\n"
-    "fact = n =>\n"
-    "    if n < 2\n"
-    "        return 1.0\n"
-    "    return n * fact(n - 1)\n"
-    "fact(6)\n";
+
+"// Hover to inspect, right-click to pin\n"
+"// Right-click + drag to adjust values\n"
+"// Right-click gutter to comment / uncomment\n"
+"// Tab for hints / autocomplete\n"
+"\n"
+"x = 3\n"
+"y = 1 + 2f + 3.0 + 3e4\n"
+"\n"
+"// block styles:\n"
+"if(x == 1) { y = 10; } // C style\n"
+"if x == 2 then y = 20  // one-liner\n"
+"if x == 3              // indented\n"
+"    y = 30\n"
+"\n"
+"sq = x => x * x\n"
+"sq(6)\n"
+"\n"
+"fact = n =>\n"
+"    if n < 2\n"
+"        return 1.0\n"
+"    return n * fact(n - 1)\n"
+"fact(6)\n"
+"\n";
 
 
 
@@ -111,6 +123,7 @@ static bool valid_ast_node_at(ParseResult *pr, int lrow, int lcol) {
 
 // All four are defined with the rest of inspection, further down.
 static void ic_inspect_forget(InteractiveCoding *ic);
+static void ic_inspect_forget_parse(InteractiveCoding *ic);
 static ICEditor *ic_active_editor(InteractiveCoding *ic);
 static void ic_inspect_refresh_scrub(InteractiveCoding *ic, ICEditor *ed, const char *src);
 static bool ic_is_pin_call(InteractiveCoding *ic, ASTNode *n);
@@ -162,7 +175,7 @@ static void ic_editor_parse_for_feedback(InteractiveCoding *ic, ICEditor *ed) {
     ed->keyboard_cursor_pos_node = NULL;
     // A reused arena address would compare equal to a fresh node and leave the
     // last parse's label sitting beside new text.
-    if (ic->ins_ed == ed) ic_inspect_forget(ic);
+    if (ic->ins_ed == ed) ic_inspect_forget_parse(ic);
     free_parse_result(&ic->parser, &ed->parse_result);
 
     if (!ed->ta) {
@@ -173,9 +186,14 @@ static void ic_editor_parse_for_feedback(InteractiveCoding *ic, ICEditor *ed) {
     char *text = ui_textarea_get_text(ed->ta);
     ed->parse_result = parse_to_asts(&ic->parser, text, PARSE_VERIFY | PARSE_OUTPUT_REFS | PARSE_OUTPUT_LINE_OFFSETS);
     ed->needs_parse = false;
+    ed->edit_serial++;
 
     {
         const char *err = parser_get_error(&ed->parse_result);
+        if (!err) {
+            if (ed->good_src) ic->sys->free(ed->good_src);
+            ed->good_src = s_strdup(text, ic->sys->malloc);
+        }
         if (err) {
             ed->has_error_bg = true;
             ed->error_bg_row = ed->parse_result.error_row;
@@ -610,21 +628,42 @@ static void ic_format_array_result(char *dst, size_t dst_size, Args *a, VMType r
     s_snprintf(dst, dst_size, "%s (%s)", text, type);
 }
 
+// The body reached the embedder: stamp it and tell both callbacks. Called
+// last by every path that has one, so a callback may re-enter.
+static void ic_code_changed(InteractiveCoding *ic, ICEditor *ed, const char *body) {
+    ed->code_serial++;
+    if (ic->on_code_changed)  ic->on_code_changed(body, ic->on_code_changed_user);
+    if (ic->on_code_changed2) ic->on_code_changed2(body, ed->code_serial, ic->on_code_changed2_user);
+}
+
+// In host mode the caret background belongs to the host's error once nothing
+// local claims it.
+static void ic_host_error_bg(ICEditor *ed) {
+    ed->has_error_bg = ed->has_host_error && ed->host_error_row >= 0;
+    ed->error_bg_row = ed->host_error_row;
+    ed->error_bg_col = ed->host_error_col;
+}
+
+// How far vm_execute_core goes. RUN is local mode; host mode stops at COMPILE
+// (local check on) or PARSE, and hands the body over even when the compile
+// fails, since the host judges it for itself.
+enum { IC_EXEC_RUN = 0, IC_EXEC_COMPILE, IC_EXEC_PARSE };
+
 // parse -> compile -> run. `src` is the assembled source -- the editor's own
 // text under its wrap and prelude -- and `body` is that text alone, which is
-// all an embedder is told about (see the on_code_changed call at the end).
+// all an embedder is told about (see ic_code_changed).
 // wrap_header_lines is subtracted from error rows, undoing what
 // build_wrapped_source() prepended so a reported row lands on a line the user
 // can see. The four error stages and the caret background go on `ed`; emitted
 // output is instance-wide and stays on `ic`.
 static void vm_execute_core(InteractiveCoding *ic, ICEditor *ed,
                             const char *src, const char *body,
-                            int wrap_header_lines) {
+                            int wrap_header_lines, int mode) {
     Parser *p = &ic->parser;
     ic_clear_emitted_outputs(ic);
     // Before the parse: a run that never executes must not leave the previous
-    // run's print output beside a parse error.
-    ic_print_reset(ed);
+    // run's print output beside a parse error. The host owns it in host mode.
+    if (mode == IC_EXEC_RUN) ic_print_reset(ed);
     ParseResult res = parse_to_asts(p, src, PARSE_OUTPUT_REFS | PARSE_OUTPUT_LINE_OFFSETS);
 
     if (parser_get_error(&res)) {
@@ -649,8 +688,18 @@ static void vm_execute_core(InteractiveCoding *ic, ICEditor *ed,
         return;
     }
 
+    if (mode == IC_EXEC_PARSE) {
+        ed->has_parse_error   = false;
+        ed->has_compile_error = false;
+        ic_host_error_bg(ed);
+        ic->result_dirty = true;
+        free_parse_result(p, &res);
+        ic_code_changed(ic, ed, body);
+        return;
+    }
+
     VM *vm = vm_create(ic->sys, p);
-    if (vm) vm_set_print_sink(vm, ic_print_sink, ed);
+    if (vm && mode == IC_EXEC_RUN) vm_set_print_sink(vm, ic_print_sink, ed);
     // Before func_create: the embedder's C functions have to exist on this VM
     // for a body that calls them to compile.
     if (vm && ic->on_vm_setup) ic->on_vm_setup(vm, ic->on_vm_setup_user);
@@ -700,20 +749,39 @@ static void vm_execute_core(InteractiveCoding *ic, ICEditor *ed,
         ic->result_dirty = true;
         vm_destroy(vm);
         free_parse_result(p, &res);
+        if (mode != IC_EXEC_RUN) ic_code_changed(ic, ed, body);
         return;
     }
 
+    // The frame limit is this editor's own run buffer, not the language's: a
+    // host runs the body in a frame of its own, so a compile-only check skips it.
     size_t need = func_frame_size(f);
-    if (need > 4096) {
+    if (mode == IC_EXEC_RUN && need > 4096) {
         ed->has_parse_error = false;
         ed->has_compile_error = true;
         ed->has_execute_error = false;
         s_snprintf(ed->compile_error, sizeof(ed->compile_error),
-            "Compile error: function frame too large (%zu bytes, max 4096)", need);
+            "Compile error: function frame too large (%d bytes, max 4096)", (int)need);
         ed->has_error_bg = false;
         ic->result_dirty = true;
         vm_destroy(vm);
         free_parse_result(p, &res);
+        return;
+    }
+    if (mode == IC_EXEC_COMPILE) {
+        // Compiled, not run: the result line, the run error and the print log
+        // are the host's.
+        ed->has_parse_error   = false;
+        ed->has_compile_error = false;
+        ic_host_error_bg(ed);
+        ic->result_dirty = true;
+        if (ic->show_c_code)   ic->c_code_output   = ic_emit_or_reason(ic, vm_emit_c(vm), vm);
+        if (ic->show_curlywas) ic->curlywas_output = ic_emit_or_reason(ic, vm_emit_curlywas(vm), vm);
+        if (ic->show_js)       ic->js_output       = ic_emit_or_reason(ic, vm_emit_js(vm), vm);
+        if (ic->show_lua)      ic->lua_output      = ic_emit_or_reason(ic, vm_emit_lua(vm), vm);
+        vm_destroy(vm);
+        free_parse_result(p, &res);
+        ic_code_changed(ic, ed, body);
         return;
     }
     unsigned char frame[4096];
@@ -779,7 +847,7 @@ static void vm_execute_core(InteractiveCoding *ic, ICEditor *ed,
     // the wrap and the prelude are this editor's own scaffolding, and an
     // embedder that had to strip them back off was coupled to their exact
     // spelling. Fires last, so the callback may re-enter.
-    if (ic->on_code_changed) ic->on_code_changed(body, ic->on_code_changed_user);
+    ic_code_changed(ic, ed, body);
 }
 
 // Compile and run `src` as the body of `ed`, applying its wrap and prelude
@@ -788,7 +856,9 @@ static void vm_execute_core(InteractiveCoding *ic, ICEditor *ed,
 static void ic_editor_execute(InteractiveCoding *ic, ICEditor *ed, const char *src) {
     int   wrap_header_lines = 0;
     char *wrapped = build_wrapped_source(ic, ed, src, &wrap_header_lines, NULL);
-    vm_execute_core(ic, ed, wrapped ? wrapped : src, src, wrap_header_lines);
+    int   mode = ic->run_mode != IC_RUN_HOST ? IC_EXEC_RUN
+               : ic->local_check            ? IC_EXEC_COMPILE : IC_EXEC_PARSE;
+    vm_execute_core(ic, ed, wrapped ? wrapped : src, src, wrap_header_lines, mode);
     if (wrapped) ic->sys->free(wrapped);
     // Inspection watches this, so a reading follows a re-run even while the
     // pointer sits still.
@@ -805,6 +875,9 @@ static void ic_editor_store_result(InteractiveCoding *ic, ICEditor *ed) {
     } else if (ed->has_compile_error) {
         s_snprintf(ed->result, sizeof(ed->result), "[Compile] %s", ed->compile_error);
         ed->result_is_error = true;
+    } else if (ed->has_host_error) {
+        s_snprintf(ed->result, sizeof(ed->result), "[Host] %s", ed->host_error);
+        ed->result_is_error = true;
     } else {
         s_snprintf(ed->result, sizeof(ed->result), "%s", ed->execute_error);
         ed->result_is_error = ed->has_execute_error;
@@ -813,7 +886,8 @@ static void ic_editor_store_result(InteractiveCoding *ic, ICEditor *ed) {
 }
 
 bool ic_editor_last_run_ok(const ICEditor *ed) {
-    return !ed->has_parse_error && !ed->has_compile_error && !ed->has_execute_error;
+    return !ed->has_parse_error && !ed->has_compile_error && !ed->has_host_error &&
+           !ed->has_execute_error;
 }
 
 bool ic_editor_run(InteractiveCoding *ic, ICEditor *ed) {
@@ -838,7 +912,7 @@ bool ic_editor_run(InteractiveCoding *ic, ICEditor *ed) {
 
     ic_editor_execute(ic, ed, src);
     ic_editor_store_result(ic, ed);
-    if (ed->on_ran && ic_editor_last_run_ok(ed))
+    if (ed->on_ran && ic->run_mode == IC_RUN_LOCAL && ic_editor_last_run_ok(ed))
         ed->on_ran(ic, ed, src, ed->on_ran_user);
     ic->sys->free(src);
     return true;
@@ -880,8 +954,8 @@ InteractiveCoding *interactive_coding_create(Tsys *sys) {
     ic_inspect_forget(ic);
     ic->ins_ed          = NULL;
     ic->ins_run_serial  = 0;
-    ic->ins_num_drawn   = 0;
-    ic->ins_num_placed  = 0;
+    ic->ov.num_drawn   = 0;
+    ic->ov.num_placed  = 0;
     ic->dragging_results_header = false;
     ic->drag_anchor_y_results   = 0.0f;
     ic->drag_anchor_split_results = 0.7f;
@@ -902,6 +976,9 @@ InteractiveCoding *interactive_coding_create(Tsys *sys) {
     ic->callbacks.user                = ic;
     ic->callbacks.draw_cell_override  = ic_draw_cell_override;
     ic->callbacks.on_content_updated  = ic_on_content_updated;
+    ic->callbacks.on_insert_text      = ic_on_insert_text;
+    ic->cp.on = true;
+    ic->cp.hints = true;
 
     ic_editor_init(ic, &ic->freeform);
     ui_textarea_set_text(ic->freeform.ta, k_default_code, true);
@@ -934,6 +1011,7 @@ void ic_editor_free(InteractiveCoding *ic, ICEditor *ed) {
         ic->editors[i] = ic->editors[--ic->num_editors];
         break;
     }
+    ic_complete_forget_editor(ic, ed);
     if (ic->rc_drag_ed == ed) { ic->rc_drag_ed = NULL; ic->rc_drag_target = NULL; }
     // ins_node points into the parse arena freed below.
     if (ic->ins_ed == ed) { ic_inspect_forget(ic); ic->ins_ed = NULL; }
@@ -948,6 +1026,7 @@ void ic_editor_free(InteractiveCoding *ic, ICEditor *ed) {
     if (ed->wrap_name)   { ic->sys->free(ed->wrap_name);   ed->wrap_name = NULL; }
     if (ed->wrap_params) { ic->sys->free(ed->wrap_params); ed->wrap_params = NULL; }
     if (ed->prelude)     { ic->sys->free(ed->prelude);     ed->prelude = NULL; }
+    if (ed->good_src)    { ic->sys->free(ed->good_src);    ed->good_src = NULL; }
     array_free(&ed->print_out, ic->sys);
 }
 
@@ -1000,6 +1079,7 @@ void interactive_coding_destroy(InteractiveCoding *ic) {
     if (!ic) return;
 
     interactive_coding_end_undo_group(ic);
+    ic_complete_release(ic);
     ic_editor_free(ic, &ic->freeform);
     ui_textarea_destroy(ic->result_ta);
     if (ic->c_code_output) ic->sys->free(ic->c_code_output);
@@ -1118,12 +1198,12 @@ void ic_update_scrubber(InteractiveCoding *ic, UIContext *ui) {
 
     // Pins follow the drag, read from `src` -- the unparsed, scrubbed source --
     // rather than from the buffer, which holds the pre-drag number until
-    // mouse-up.
+    // mouse-up. In host mode that only re-aims the probes.
     ic_inspect_refresh_scrub(ic, ed, src);
 
     // The same follow-up a normal run gets, so an owner forwarding working code
     // keeps up with the drag.
-    if (ed->on_ran && ic_editor_last_run_ok(ed))
+    if (ed->on_ran && ic->run_mode == IC_RUN_LOCAL && ic_editor_last_run_ok(ed))
         ed->on_ran(ic, ed, src, ed->on_ran_user);
 
     if (body) ic->sys->free(body);
@@ -1181,9 +1261,20 @@ static void ic_inspect_forget(InteractiveCoding *ic) {
     ic->ins_place_todo  = 2;
     for (int i = 0; i < IC_INSPECT_MAX_SITES; i++) {
         ic->ins_sites[i].label[0] = '\0';
-        ic->ins_sites[i].placed   = 0;
+        ic->ins_sites[i].cache.placed   = 0;
         ic->ins_sites[i].row      = -1;
     }
+}
+
+// The parse the sites were computed against is going. Locally that is the end of
+// them; in host mode the readings are the host's and stay up, and the next
+// refresh decides which still stand.
+static void ic_inspect_forget_parse(InteractiveCoding *ic) {
+    if (ic->run_mode != IC_RUN_HOST) { ic_inspect_forget(ic); return; }
+    ic->ins_node        = NULL;
+    ic->ins_hover_valid = false;
+    ic->ins_place_todo  = 2;
+    for (int i = 0; i < IC_INSPECT_MAX_SITES; i++) ic->ins_sites[i].cache.placed = 0;
 }
 
 // Drop the hover reading alone, leaving the pins as they stand.
@@ -1196,7 +1287,7 @@ static void ic_inspect_drop_hover(InteractiveCoding *ic) {
     ICInspectSite *s = &ic->ins_sites[IC_INSPECT_ID_HOVER];
     s->label[0] = '\0';
     s->row = s->col = s->row2 = s->col2 = -1;
-    s->placed = 0;
+    s->cache.placed = 0;
     ic_inspect_reset(&s->stats);
     ic->ins_node        = NULL;
     ic->ins_hover_valid = false;
@@ -1251,8 +1342,8 @@ static bool ic_ident_is(InteractiveCoding *ic, ASTNode *n, const char *name) {
 static ASTNode *ic_inspect_assign_rhs(ASTNode *n) {
     if (!n) return NULL;
 
-    // On the `=`. A group carrying the token is `(a = 1)`, whose span already
-    // starts at the paren -- ic_ins_wrap's `grouped` path handles that.
+    // On the `=`. A group carrying the token is `(a = 1)`, which is itself an
+    // expression and is inspected as it stands.
     if (n->token == TOK_EQ && n->left && n->right && !n->left_bracket)
         return n->right;
 
@@ -1349,23 +1440,7 @@ static ASTNode *ic_inspect_retarget(InteractiveCoding *ic, ASTNode *hover) {
 // bracket yields the group and hovering an operator yields both operands.
 static bool ic_inspect_subtree_span(ParseResult *pr, ASTNode *node, size_t text_len,
                                     size_t *out_lo, size_t *out_hi) {
-    if (!pr->txt_to_ref || !node) return false;
-
-    size_t lo = (size_t)-1, hi = 0;
-    size_t n = pr->num_txt_to_ref;
-    if (n > text_len) n = text_len;
-    for (size_t o = 0; o < n; o++) {
-        for (ASTNode *p = pr->txt_to_ref[o]; p; p = p->parent) {
-            if (p != node) continue;
-            if (o < lo) lo = o;
-            if (o + 1 > hi) hi = o + 1;
-            break;
-        }
-    }
-    if (lo == (size_t)-1 || hi <= lo) return false;
-    *out_lo = lo;
-    *out_hi = hi;
-    return true;
+    return vm_subtree_span(pr, node, text_len, out_lo, out_hi) != 0;
 }
 
 static bool ic_inspect_span(ICEditor *ed, ASTNode *hover, const char *text,
@@ -1375,28 +1450,9 @@ static bool ic_inspect_span(ICEditor *ed, ASTNode *hover, const char *text,
     size_t lo, hi;
     if (!ic_inspect_subtree_span(pr, hover, text_len, &lo, &hi)) return false;
 
-    // Three clamps, and the ORDER is load-bearing.
-    //
-    // 1. A span crossing a line means a block or statement list, and
-    //    __ins({ ... }, 0) is not an expression. Refuse it outright.
-    for (size_t o = lo; o < hi; o++)
-        if (text[o] == '\n' || text[o] == '\r') return false;
-
-    // 2. A comment attributed to the node would put the closing paren inside
-    //    it: __ins(x + y // c, 0). Cut before one.
-    //
-    //    MUST come after the newline check: cutting a whole-scope span (what
-    //    a `;` resolves to) at line one's `//` first would make it single-line
-    //    and pass check 1.
-    for (size_t o = lo; o + 1 < hi; o++) {
-        if (text[o] == '/' && (text[o + 1] == '/' || text[o + 1] == '*')) { hi = o; break; }
-    }
-
-    // 3. Trailing whitespace can be attributed to the node. Harmless to
-    //    splice, but trimming keeps the cut above reachable.
-    while (hi > lo && (text[hi - 1] == ' ' || text[hi - 1] == '\t')) hi--;
-
-    if (hi <= lo) return false;
+    // Refused across a line (a block is not an expression), cut before a
+    // comment, trailing blanks trimmed -- in that order (vm_inspect_span_clamp).
+    if (!vm_inspect_span_clamp(text, &lo, &hi)) return false;
 
     // Whatever the clamps did, the span must still cover the pointed-at cell:
     // one trimmed away from the pointer describes something the user is not
@@ -1410,14 +1466,10 @@ static bool ic_inspect_span(ICEditor *ed, ASTNode *hover, const char *text,
     return true;
 }
 
-// ---- instrumenting the copy -------------------------------------------------
+// ---- text insertions (the pin gesture) --------------------------------------
 //
-// Every site is instrumented by INSERTION, never by rewriting: "__ins(" before
-// the span and ", id)" after it, and the same pair around a pin's whole
-// inspect(...) call. inspect(x) is type-transparent, so wrapping cannot change
-// what the program computes and nothing has to find a paren or rewrite a name.
-// Sites therefore NEST with no special case -- the `*` inside a pin is
-// __ins(__ins(a * b, 0), 3).
+// Inspection itself never edits text: every site is a probe (vm_set_inspect_
+// probes) on the node its span names. Only pinning writes into the buffer.
 typedef struct {
     size_t offset;
     int    depth;     // ties at one offset break outermost-first (see below)
@@ -1425,8 +1477,7 @@ typedef struct {
 } ICInsEdit;
 
 // By (offset, depth). Openers carry ascending depth and closers descending, so
-// two sites starting or ending on the SAME byte nest rather than interleave --
-// which is what a hover span exactly equal to a pin's argument produces.
+// two insertions on the SAME byte nest rather than interleave.
 static void ic_ins_edit_sort(ICInsEdit *e, int n) {
     for (int i = 1; i < n; i++) {
         ICInsEdit key = e[i];
@@ -1464,30 +1515,6 @@ static char *ic_inspect_splice_many(InteractiveCoding *ic, const char *text, siz
     w += text_len - read;
     out[w] = '\0';
     return out;
-}
-
-// The two edits that wrap [lo, hi) into __ins(..., id).
-//
-// The operand's own PARENTHESES are not decoration: juxtaposition binds looser
-// than the comma, so a juxtaposed operand swallows the slot id.
-//
-//     __ins(sq 4, 0)      parses as  __ins(sq (4, 0))   -- "expected 2 args"
-//     __ins((sq 4), 0)    parses as  __ins(sq 4, 0)     -- what was meant
-//
-// `grouped` says the span is ALREADY a group, and then they must be left off:
-// the compiler rejects a doubled group outright (see spelling.paren2 in
-// tests/test_inspect.c). Hovering a bracket is what produces one.
-static void ic_ins_wrap(ICInsEdit *edits, int *n, size_t lo, size_t hi,
-                        int id, int depth, int grouped) {
-    if (*n + 2 > 2 * IC_INSPECT_MAX_SITES) return;
-    ICInsEdit *o = &edits[(*n)++];
-    o->offset = lo;
-    o->depth  = depth;
-    s_snprintf(o->text, sizeof(o->text), grouped ? "__ins(" : "__ins((");
-    ICInsEdit *c = &edits[(*n)++];
-    c->offset = hi;
-    c->depth  = -depth;          // closers nest the other way round
-    s_snprintf(c->text, sizeof(c->text), grouped ? ", %d)" : "), %d)", id);
 }
 
 // ---- pins -------------------------------------------------------------------
@@ -1531,14 +1558,13 @@ static void ic_inspect_collect_pins(InteractiveCoding *ic, ParseResult *pr, ASTN
                                 text_len, out, max, count);
 }
 
-// Compile and run the instrumented source, privately.
+/// Compile and run the buffer privately, every probe compiled in by node
+// (vm_set_inspect_probes) -- the local executor. The text is never touched.
 //
 // vm_execute_core with everything that REPORTS stripped out, which is the point
 // rather than an optimisation: a hover must not change what the user sees or
-// what the embedder is told. Nothing here reaches on_code_changed (an embedder
-// may push that source straight into a live engine, and source containing
-// __ins(...) must never get there), ed->on_ran, ed->result, the four error
-// stages, the print log or any emitter.
+// what the embedder is told. Nothing here reaches on_code_changed, ed->on_ran,
+// ed->result, the four error stages, the print log or any emitter.
 //
 // on_vm_setup IS called: the embedder's natives have to exist on this VM or a
 // body naming one would not compile, and binding them is also what makes the
@@ -1546,28 +1572,43 @@ static void ic_inspect_collect_pins(InteractiveCoding *ic, ParseResult *pr, ASTN
 //
 // Every failure is swallowed. Returns whether the program actually RAN, which
 // the caller needs because "reported nothing" and "never ran" differ once pins
-// exist: a hover that cannot be instrumented must not blank every pin to `-`.
+// exist: a hover that cannot be inspected must not blank every pin to `-`.
 //
-// `sig_off` (IC_INSPECT_NO_ANCHOR for none) is a lambda parameter list's offset
-// in `src`: the function's signatures are written to `sigs`. Read after the
-// compile and whether or not it succeeded -- every call site compiled before an
-// error has already specialised the function.
-static int ic_run_instrumented(InteractiveCoding *ic, ICEditor *ed, const char *src,
-                               size_t sig_off, char *sigs, int sigs_max) {
+// A probe marked is_sig wraps nothing: the function's signatures are written to
+// `sigs` instead. Read after the compile and whether or not it succeeded --
+// every call site compiled before an error has already specialised the function.
+static int ic_run_probes(InteractiveCoding *ic, ICEditor *ed, const char *src,
+                         const ICProbe *probes, int n, char *sigs, int sigs_max) {
     Parser *p = &ic->parser;
-    bool want_sigs = sig_off != IC_INSPECT_NO_ANCHOR && sigs && sigs_max > 0;
     if (sigs && sigs_max > 0) sigs[0] = '\0';
 
     int    header_lines = 0;
     size_t body_off = 0;
     char *wrapped = build_wrapped_source(ic, ed, src, &header_lines, &body_off);
     const char *full = wrapped ? wrapped : src;
+    size_t full_len = s_strlen(full);
 
-    ParseResult res = parse_to_asts(p, full, want_sigs ? PARSE_OUTPUT_REFS : 0);
+    ParseResult res = parse_to_asts(p, full, PARSE_OUTPUT_REFS);
     if (parser_get_error(&res)) {
         free_parse_result(p, &res);
         if (wrapped) ic->sys->free(wrapped);
         return 0;
+    }
+
+    VMProbe  vp[IC_INSPECT_MAX_SITES];
+    int      nvp = 0;
+    ASTNode *sig_node = NULL;
+    for (int i = 0; i < n; i++) {
+        size_t lo = body_off + probes[i].lo, hi = body_off + probes[i].hi;
+        if (probes[i].is_sig) {
+            if (res.txt_to_ref && lo < res.num_txt_to_ref) sig_node = res.txt_to_ref[lo];
+            continue;
+        }
+        ASTNode *node = vm_probe_node_for_span(&res, full, full_len, lo, hi);
+        if (!node || nvp >= IC_INSPECT_MAX_SITES) continue;
+        vp[nvp].node = node;
+        vp[nvp].id   = probes[i].id;
+        nvp++;
     }
 
     VM *vm = vm_create(ic->sys, p);
@@ -1579,6 +1620,7 @@ static int ic_run_instrumented(InteractiveCoding *ic, ICEditor *ed, const char *
     // No print sink installed: a hover must not append to the print log.
     vm_set_inspect_sink(vm, ic_inspect_sink, ic);
     vm_set_inspect_array_sink(vm, ic_inspect_arr_sink, ic);
+    vm_set_inspect_probes(vm, vp, nvp);
     if (ic->on_vm_setup) ic->on_vm_setup(vm, ic->on_vm_setup_user);
 
     int ran = 0;
@@ -1595,8 +1637,7 @@ static int ic_run_instrumented(InteractiveCoding *ic, ICEditor *ed, const char *
             ran = 1;
         }
     }
-    if (want_sigs && res.txt_to_ref && body_off + sig_off < res.num_txt_to_ref)
-        vm_signature_labels(vm, res.txt_to_ref[body_off + sig_off], sigs, sigs_max);
+    if (sig_node && sigs && sigs_max > 0) vm_signature_labels(vm, sig_node, sigs, sigs_max);
     vm_destroy(vm);
     free_parse_result(p, &res);
     if (wrapped) ic->sys->free(wrapped);
@@ -1617,46 +1658,43 @@ static void ic_inspect_rowcol(ParseResult *pr, size_t off, int *out_row, int *ou
     *out_col = (int)(off - row_start);
 }
 
-// Re-run the private compile for the hovered expression AND every pin, and
-// re-format their labels. One parse+compile+execute fills every slot; a site
-// with nothing to show is left with an empty label.
-static void ic_inspect_refresh(InteractiveCoding *ic, ICEditor *ed, ASTNode *hover,
-                               size_t hover_off) {
-    // Pins occupy a line each in the results panel, so a refresh that changes
-    // them makes the panel recompose. Remembered across the reset, so the run
-    // that REMOVES the last pin still repaints the panel showing it.
-    int had_pins = ic->ins_num_sites - 1;
+static bool ic_probe_eq(const ICProbe *a, const ICProbe *b) {
+    return a->id == b->id && a->lo == b->lo && a->hi == b->hi && a->is_sig == b->is_sig;
+}
 
-    // The pin readings as they stand, put back if this refresh never gets as
-    // far as a run -- otherwise a hover whose copy will not compile drops every
-    // pin to the `-` that means "never executed". Stats as well as labels: the
-    // in-code label renders from `label`, the results-panel line from `stats`.
-    char      prev[IC_INSPECT_MAX_SITES][sizeof(ic->ins_sites[0].label)];
-    ICInspect prev_stats[IC_INSPECT_MAX_SITES];
-    for (int i = 0; i < IC_INSPECT_MAX_SITES; i++) {
-        s_snprintf(prev[i], sizeof(prev[i]), "%s", ic->ins_sites[i].label);
-        prev_stats[i] = ic->ins_sites[i].stats;
+// Hand the host a new probe set. A set equal to the last one is not news: the
+// serial stays, so passes in flight for it still land.
+static void ic_inspect_publish(InteractiveCoding *ic, ICEditor *ed, const ICProbe *p, int n) {
+    if (n > IC_INSPECT_MAX_SITES) n = IC_INSPECT_MAX_SITES;
+    if (n == ic->ins_num_probes) {
+        int same = 1;
+        for (int i = 0; i < n && same; i++) same = ic_probe_eq(&p[i], &ic->ins_probes[i]);
+        if (same) return;
     }
+    for (int i = 0; i < n; i++) ic->ins_probes[i] = p[i];
+    ic->ins_num_probes = n;
+    ic->ins_probe_serial++;
+    if (ic->on_probes_changed)
+        ic->on_probes_changed(ic->ins_probes, n, ed ? ed->code_serial : 0,
+                              ic->ins_probe_serial, ic->on_probes_changed_user);
+}
 
+// Who is being inspected, and the probe set that asks about them. Slot 0 is the
+// hovered expression, 1.. the pins in source order; each site gets its anchors
+// and its stats are reset. Returns the probe count.
+static int ic_inspect_build_sites(InteractiveCoding *ic, ICEditor *ed, ASTNode *hover,
+                                  size_t hover_off, const char *text, size_t text_len,
+                                  ICProbe *probes) {
     for (int i = 0; i < IC_INSPECT_MAX_SITES; i++) {
         ICInspectSite *s = &ic->ins_sites[i];
         s->label[0] = '\0';
         s->row = s->col = s->row2 = s->col2 = -1;
         s->call_lo = s->call_hi = s->arg_lo = s->arg_hi = 0;
-        s->placed = 0;
+        s->cache.placed = 0;
         ic_inspect_reset(&s->stats);
     }
-    ic->ins_num_sites  = 1;
-    ic->ins_place_todo = 2;
-    if (had_pins) ic->result_dirty = true;
-    if (!ed || !ed->ta) return;
-
-    char *text = ui_textarea_get_text(ed->ta);
-    if (!text) return;
-    size_t text_len = s_strlen(text);
     ParseResult *pr = &ed->parse_result;
 
-    // ---- who is being inspected ----
     int pins = 0;
     if (pr->code_tree)
         ic_inspect_collect_pins(ic, pr, pr->code_tree, text_len,
@@ -1670,39 +1708,18 @@ static void ic_inspect_refresh(InteractiveCoding *ic, ICEditor *ed, ASTNode *hov
     for (int i = 1; have_hover && i <= pins; i++)
         if (hlo == ic->ins_sites[i].call_lo && hhi == ic->ins_sites[i].call_hi) have_hover = 0;
 
-    // A parameter list is bindings, not a value: nothing wraps it, the compile
+    // A parameter list is bindings, not a value: nothing is wrapped, the compile
     // is asked for the function's signatures instead.
     int sig = have_hover && ic_inspect_is_param_list(hover);
 
-    ic->ins_num_sites = pins + 1;
-    if (pins) ic->result_dirty = true;
-
-    // ---- instrument ----
-    ICInsEdit edits[2 * IC_INSPECT_MAX_SITES];
-    int       n_edits = 0;
-    for (int i = 1; i <= pins; i++)
-        ic_ins_wrap(edits, &n_edits, ic->ins_sites[i].call_lo, ic->ins_sites[i].call_hi,
-                    i, i, /*grouped=*/0);   // a call node, never a bracket group
-    if (have_hover && !sig)
-        ic_ins_wrap(edits, &n_edits, hlo, hhi, IC_INSPECT_ID_HOVER, IC_INSPECT_MAX_SITES,
-                    hover->left_bracket != 0);
-
-    // Where the parameter list lands once the pins' edits are spliced in ahead
-    // of it.
-    size_t sig_off = IC_INSPECT_NO_ANCHOR;
-    if (sig) {
-        sig_off = hlo;
-        for (int i = 0; i < n_edits; i++)
-            if (edits[i].offset <= hlo) sig_off += s_strlen(edits[i].text);
-    }
-
-    // Kept because `text` is freed below, and a reading that merely repeats
-    // what is on screen is worth nothing (see the drop at the end).
-    char span[sizeof(ic->ins_sites[0].label)];
-    span[0] = '\0';
-    if (have_hover && hhi - hlo < sizeof(span)) {
-        ic->sys->memcpy(span, text + hlo, hhi - hlo);
-        span[hhi - hlo] = '\0';
+    ic->ins_num_sites  = pins + 1;
+    ic->ins_have_hover = have_hover != 0;
+    ic->ins_hover_sig  = sig != 0;
+    // Kept: a reading that merely repeats what is on screen is worth nothing.
+    ic->ins_hover_span[0] = '\0';
+    if (have_hover && hhi - hlo < sizeof(ic->ins_hover_span)) {
+        ic->sys->memcpy(ic->ins_hover_span, text + hlo, hhi - hlo);
+        ic->ins_hover_span[hhi - hlo] = '\0';
     }
 
     // Where each label wants to sit: both ends, since placement measures to
@@ -1713,39 +1730,27 @@ static void ic_inspect_refresh(InteractiveCoding *ic, ICEditor *ed, ASTNode *hov
         ic_inspect_rowcol(pr, hhi > hlo ? hhi - 1 : hlo,
                           &ic->ins_sites[0].row2, &ic->ins_sites[0].col2);
     }
+    int n = 0;
     for (int i = 1; i <= pins; i++) {
         ICInspectSite *s = &ic->ins_sites[i];
         ic_inspect_rowcol(pr, s->call_lo, &s->row, &s->col);
         ic_inspect_rowcol(pr, s->call_hi > s->call_lo ? s->call_hi - 1 : s->call_lo,
                           &s->row2, &s->col2);
+        probes[n].id = i; probes[n].lo = s->call_lo; probes[n].hi = s->call_hi; probes[n].is_sig = 0;
+        n++;
     }
+    if (have_hover) {
+        probes[n].id = IC_INSPECT_ID_HOVER; probes[n].lo = hlo; probes[n].hi = hhi; probes[n].is_sig = sig;
+        n++;
+    }
+    return n;
+}
 
-    // Restore the pin readings this refresh is about to fail to replace, so a
-    // hover that cannot be instrumented leaves what is on screen alone.
-    #define IC_INSPECT_KEEP_PREV()                                          \
-        do { for (int i = 1; i <= pins; i++) {                              \
-                 s_snprintf(ic->ins_sites[i].label,                         \
-                            sizeof(ic->ins_sites[i].label), "%s", prev[i]); \
-                 ic->ins_sites[i].stats = prev_stats[i];                    \
-             } } while (0)
-
-    if (n_edits == 0 && !sig) { ic->sys->free(text); IC_INSPECT_KEEP_PREV(); return; }
-
-    char *instrumented = ic_inspect_splice_many(ic, text, text_len, edits, n_edits);
-    ic->sys->free(text);
-    if (!instrumented) { IC_INSPECT_KEEP_PREV(); return; }
-
-    char sigs[sizeof(ic->ins_sites[0].label)];
-    int ran = ic_run_instrumented(ic, ed, instrumented, sig_off, sigs, (int)sizeof(sigs));
-    ic->sys->free(instrumented);
-    if (sig) s_snprintf(ic->ins_sites[0].label, sizeof(ic->ins_sites[0].label), "%s", sigs);
-    if (!ran) { IC_INSPECT_KEEP_PREV(); return; }
-    #undef IC_INSPECT_KEEP_PREV
-
-    // ---- format ----
+// Every site's collected stats into its label.
+static void ic_inspect_format_sites(InteractiveCoding *ic) {
     for (int i = 0; i < ic->ins_num_sites; i++) {
         ICInspectSite *s = &ic->ins_sites[i];
-        if (i == IC_INSPECT_ID_HOVER && (!have_hover || sig)) continue;
+        if (i == IC_INSPECT_ID_HOVER && (!ic->ins_have_hover || ic->ins_hover_sig)) continue;
         ic_inspect_format(&s->stats, s->label, (int)sizeof(s->label));
 
         // A pin that never executed (an untaken branch, an uncalled function)
@@ -1759,8 +1764,89 @@ static void ic_inspect_refresh(InteractiveCoding *ic, ICEditor *ed, ASTNode *hov
     // is the same (padding only), but `7 (10)` over a literal 7 survives -- the
     // count is new information. Hover only: a pin was placed deliberately, and
     // one rendering as nothing looks broken rather than tactful.
-    if (ic_inspect_label_is_source(span, ic->ins_sites[0].label))
+    if (ic->ins_have_hover && !ic->ins_hover_sig &&
+        ic_inspect_label_is_source(ic->ins_hover_span, ic->ins_sites[0].label))
         ic->ins_sites[0].label[0] = '\0';
+}
+
+// Recompute the hovered expression AND every pin. Locally: one private run fills
+// every slot and the labels are formatted. In host mode: the probe set goes to
+// the host, and the readings on screen stay until its pass arrives.
+static void ic_inspect_refresh(InteractiveCoding *ic, ICEditor *ed, ASTNode *hover,
+                               size_t hover_off) {
+    // Pins occupy a line each in the results panel, so a refresh that changes
+    // them makes the panel recompose. Remembered across the reset, so the run
+    // that REMOVES the last pin still repaints the panel showing it.
+    int had_pins = ic->ins_num_sites - 1;
+
+    // The readings as they stand, put back where this refresh cannot replace
+    // them -- otherwise a hover whose run fails drops every pin to the `-` that
+    // means "never executed". Stats as well as labels: the in-code label renders
+    // from `label`, the results-panel line from `stats`.
+    char      prev[IC_INSPECT_MAX_SITES][sizeof(ic->ins_sites[0].label)];
+    ICInspect prev_stats[IC_INSPECT_MAX_SITES];
+    for (int i = 0; i < IC_INSPECT_MAX_SITES; i++) {
+        s_snprintf(prev[i], sizeof(prev[i]), "%s", ic->ins_sites[i].label);
+        prev_stats[i] = ic->ins_sites[i].stats;
+    }
+    ICProbe prev_hover = { 0, 0, 0, 0 };
+    int     had_hover = 0;
+    for (int i = 0; i < ic->ins_num_probes; i++)
+        if (ic->ins_probes[i].id == IC_INSPECT_ID_HOVER) { prev_hover = ic->ins_probes[i]; had_hover = 1; }
+
+    ic->ins_place_todo = 2;
+    if (had_pins) ic->result_dirty = true;
+
+    char *text = (ed && ed->ta) ? ui_textarea_get_text(ed->ta) : NULL;
+    if (!text) {
+        for (int i = 0; i < IC_INSPECT_MAX_SITES; i++) {
+            ic->ins_sites[i].label[0] = '\0';
+            ic->ins_sites[i].row = -1;
+        }
+        ic->ins_num_sites  = 1;
+        ic->ins_have_hover = false;
+        if (ic->run_mode == IC_RUN_HOST) ic_inspect_publish(ic, ed, NULL, 0);
+        return;
+    }
+    size_t text_len = s_strlen(text);
+
+    ICProbe probes[IC_INSPECT_MAX_SITES];
+    int     np   = ic_inspect_build_sites(ic, ed, hover, hover_off, text, text_len, probes);
+    int     pins = ic->ins_num_sites - 1;
+    if (pins) ic->result_dirty = true;
+
+    #define IC_INSPECT_KEEP_PREV()                                          \
+        do { for (int i = 1; i <= pins; i++) {                              \
+                 s_snprintf(ic->ins_sites[i].label,                         \
+                            sizeof(ic->ins_sites[i].label), "%s", prev[i]); \
+                 ic->ins_sites[i].stats = prev_stats[i];                    \
+             } } while (0)
+
+    if (ic->run_mode == IC_RUN_HOST) {
+        ic->sys->free(text);
+        // What is on screen is the best there is until the host answers: the
+        // pins by position while their count holds, the hover while it is the
+        // same span.
+        if (pins == had_pins) IC_INSPECT_KEEP_PREV();
+        for (int i = 0; i < np; i++) {
+            if (probes[i].id != IC_INSPECT_ID_HOVER || !had_hover || !ic_probe_eq(&probes[i], &prev_hover)) continue;
+            s_snprintf(ic->ins_sites[0].label, sizeof(ic->ins_sites[0].label), "%s", prev[0]);
+            ic->ins_sites[0].stats = prev_stats[0];
+        }
+        ic_inspect_publish(ic, ed, probes, np);
+        return;
+    }
+
+    if (np == 0) { ic->sys->free(text); IC_INSPECT_KEEP_PREV(); return; }
+
+    char sigs[sizeof(ic->ins_sites[0].label)];
+    int ran = ic_run_probes(ic, ed, text, probes, np, sigs, (int)sizeof(sigs));
+    ic->sys->free(text);
+    if (ic->ins_hover_sig) s_snprintf(ic->ins_sites[0].label, sizeof(ic->ins_sites[0].label), "%s", sigs);
+    if (!ran) { IC_INSPECT_KEEP_PREV(); return; }
+    #undef IC_INSPECT_KEEP_PREV
+
+    ic_inspect_format_sites(ic);
 }
 
 // Re-read every PIN's values from a source string that is not the buffer, for
@@ -1768,7 +1854,8 @@ static void ic_inspect_refresh(InteractiveCoding *ic, ICEditor *ed, ASTNode *hov
 // ic_update_scrubber unparses each frame, so the spans are found in THAT
 // string, which needs its own parse, and the pins match the existing slots by
 // position in source order. Anchors and placements are untouched -- the buffer
-// is unchanged, so the last ordinary refresh's placements still hold.
+// is unchanged, so the last ordinary refresh's placements still hold. In host
+// mode the pins' spans in that string become the probe set instead.
 static void ic_inspect_refresh_scrub(InteractiveCoding *ic, ICEditor *ed, const char *src) {
     if (!ic_inspect_on(ic) || ic->ins_ed != ed || ic->ins_num_sites <= 1 || !src) return;
 
@@ -1787,13 +1874,14 @@ static void ic_inspect_refresh_scrub(InteractiveCoding *ic, ICEditor *ed, const 
     // stay put. Unparsing a number does not add or remove an inspect(), and if
     // it somehow does, stale beats wrong.
     if (n == ic->ins_num_sites - 1 && n > 0) {
-        ICInsEdit edits[2 * IC_INSPECT_MAX_SITES];
-        int       ne = 0;
-        for (int i = 0; i < n; i++)
-            ic_ins_wrap(edits, &ne, pins[i].call_lo, pins[i].call_hi, i + 1, i + 1, 0);
-
-        char *instrumented = ic_inspect_splice_many(ic, src, len, edits, ne);
-        if (instrumented) {
+        ICProbe probes[IC_INSPECT_MAX_SITES];
+        for (int i = 0; i < n; i++) {
+            probes[i].id = i + 1; probes[i].lo = pins[i].call_lo; probes[i].hi = pins[i].call_hi;
+            probes[i].is_sig = 0;
+        }
+        if (ic->run_mode == IC_RUN_HOST) {
+            ic_inspect_publish(ic, ed, probes, n);
+        } else {
             // Saved before the reset: the run may not happen, and the panel
             // reads these rather than the labels.
             ICInspect prev_stats[IC_INSPECT_MAX_SITES];
@@ -1802,8 +1890,7 @@ static void ic_inspect_refresh_scrub(InteractiveCoding *ic, ICEditor *ed, const 
                 ic_inspect_reset(&ic->ins_sites[i].stats);
             }
 
-            int ran = ic_run_instrumented(ic, ed, instrumented, IC_INSPECT_NO_ANCHOR, NULL, 0);
-            ic->sys->free(instrumented);
+            int ran = ic_run_probes(ic, ed, src, probes, n, NULL, 0);
 
             // A drag passes through values the code cannot compile with -- an
             // array index out of range, a divisor of zero. Those frames leave
@@ -1824,371 +1911,12 @@ static void ic_inspect_refresh_scrub(InteractiveCoding *ic, ICEditor *ed, const 
     free_parse_result(&ic->parser, &pr);
 }
 
-// ---- placement -------------------------------------------------------------
+// The label placement/claim/paint layer. Defined in a file of its own, #included
+// like interactive_coding_wrap.c so every build that lists this file gets it.
+#include "ic_overlay.c"
 
-// What is at this screen position, as far as a label is concerned.
-//
-// OUTSIDE is kept apart from TAKEN because the end-of-line rules look for a
-// row's last occupied cell, and the wall past the right edge is not code:
-// counting it would put every row's "end of line" off the textarea. Below the
-// last line of the buffer is not outside: that rest of the rect is free.
-#define IC_CELL_OUTSIDE 0
-#define IC_CELL_FREE    1
-#define IC_CELL_TAKEN   2
-static int ic_inspect_cell_kind(InteractiveCoding *ic, UIContext *ui, UITextArea *ta,
-                                float sx, float sy) {
-    int r, c;
-    bool in_text = ui_textarea_screen_to_pos(ta, sx, sy, &r, &c);
-    if (!in_text && !ui_textarea_screen_past_end(ta, sx, sy)) return IC_CELL_OUTSIDE;
-
-    // Anything already painted this frame owns its cell -- first-draw-wins, so
-    // drawing over it would vanish rather than blend. Mostly the scrubber's
-    // digit wheels, which sit exactly where a pin on that line wants to be.
-    OutputCell cell;
-    if (ui_get_cell(ui, (int)sx, (int)sy, &cell) && (cell.flags & CELL_FLAGS_DRAWN))
-        return IC_CELL_TAKEN;
-
-    // Labels drawn this frame claim their padding too: two readings butted
-    // together are as unreadable as one butted against code.
-    for (int i = 0; i < ic->ins_num_drawn; i++) {
-        ICInspectRect *d = &ic->ins_drawn[i];
-        if (sy == d->y && sx >= d->x && sx < d->x + (float)d->len) return IC_CELL_TAKEN;
-    }
-    if (!in_text) return IC_CELL_FREE;
-    char ch = ui_textarea_get_char_at(ta, r, c);   // '\0' past end-of-line
-    return (ch == '\0' || ch == ' ' || ch == '\t') ? IC_CELL_FREE : IC_CELL_TAKEN;
-}
-
-// Off the rect counts as not free -- there is nothing there to draw on. A
-// column of a `rows`-high block, from row sy down.
-static bool ic_inspect_cell_free(InteractiveCoding *ic, UIContext *ui, UITextArea *ta,
-                                 float sx, float sy, int rows) {
-    for (int k = 0; k < rows; k++)
-        if (ic_inspect_cell_kind(ic, ui, ta, sx, sy + (float)k) != IC_CELL_FREE) return false;
-    return true;
-}
-
-// ---- what makes one spot better than another -------------------------------
-//
-// Rule 1 puts the label past the end of the expression's own line when it is
-// close enough. It exists because the general search is easy to talk into a
-// spot several rows away when there is obvious free space at the end of the
-// line, and it is the one spot that costs no row of eye movement.
-//
-// Rule 2 is for the rows either side: a label there reads as a CAPTION, so it
-// is CENTRED on the hovered token rather than aligned on the start of the
-// subtree, which on a wide expression is nowhere near the character the
-// pointer is on. Taken only when it fits exactly centred.
-//
-// Rule 3 is rule 1 for those two rows, with a shorter reach -- they already
-// cost a row of eye movement -- measured from that same centre, and needing a
-// line with something ON it, past the end of a BLANK line being the middle of
-// nowhere.
-//
-// Rule 4 is the fallback: the cheapest spot by distance, a ROW step counting a
-// QUARTER of a column step, so far-to-the-right loses to directly above or
-// below. Costs are quarter-columns (x * 4, y * 1) to stay in integers; on the
-// expression's own row(s) distance is to its NEARER END, and off them to the
-// centred position rule 2 asked for.
-#define IC_INSPECT_EOL_REACH     15   // rule 1: the expression's own line
-#define IC_INSPECT_EOL_REACH_ADJ 13   // rule 3: the lines either side
-#define IC_INSPECT_COL_COST 4    // one column step, in quarter-columns
-#define IC_INSPECT_ROW_COST 1    // one row step: a quarter of a column
-// How far either side of the expression to look for a gap.
-#define IC_INSPECT_SEARCH_COLS 100
-// What a three-row block pays, in columns, per row it is shifted off centre.
-#define IC_INSPECT_SHIFT_COLS  8
-
-// Where a label of `need` padded cells goes at the END of screen rows sy ..
-// sy+rows-1: one cell past the last occupied cell of any of them, the whole
-// block free from there. Columns are offsets from base_x, and the answer is the
-// PADDED block's offset. False when the rows are blank -- there is no tail to
-// sit behind.
-static bool ic_inspect_row_tail(InteractiveCoding *ic, UIContext *ui, UITextArea *ta,
-                                float base_x, float sy, int rows, int need, int *out_c) {
-    int last_taken = 0;
-    int have       = 0;
-    for (int k = 0; k < rows; k++) {
-        for (int c = -IC_INSPECT_SEARCH_COLS; c <= IC_INSPECT_SEARCH_COLS; c++) {
-            if (ic_inspect_cell_kind(ic, ui, ta, base_x + (float)c, sy + (float)k) == IC_CELL_TAKEN &&
-                (!have || c > last_taken)) {
-                last_taken = c;
-                have = 1;
-            }
-        }
-    }
-    if (!have) return false;
-
-    int st = last_taken + 1;
-    for (int c = st; c < st + need; c++)
-        if (!ic_inspect_cell_free(ic, ui, ta, base_x + (float)c, sy, rows))
-            return false;
-
-    *out_c = st;
-    return true;
-}
-
-// The cost of a label whose text starts at column offset `tx` on row `sy`, in
-// quarter-columns: distance to whichever END of the expression is nearer.
-// `tail_dx` is the rightmost character's offset from the leftmost, ay0/ay1 the
-// rows the two ends are on (equal unless wrap has split the expression).
-//
-// Off both of those rows the label is a caption centred on the hovered token,
-// so the distance that matters is to `center_tx` -- where its text starts when
-// centred -- and not to an end of the subtree columns away from the pointer.
-static int ic_inspect_min_cost(int tx, float sy, int tail_dx, float ay0, float ay1,
-                               int center_tx) {
-    int dy0 = (int)(sy - ay0); if (dy0 < 0) dy0 = -dy0;
-    int dy1 = (int)(sy - ay1); if (dy1 < 0) dy1 = -dy1;
-
-    if (dy0 && dy1) {
-        int dx = tx - center_tx; if (dx < 0) dx = -dx;
-        int dy = dy0 < dy1 ? dy0 : dy1;
-        return dx * IC_INSPECT_COL_COST + dy * IC_INSPECT_ROW_COST;
-    }
-
-    int dx0 = tx;            if (dx0 < 0) dx0 = -dx0;
-    int dx1 = tx - tail_dx;  if (dx1 < 0) dx1 = -dx1;
-
-    int c0 = dx0 * IC_INSPECT_COL_COST + dy0 * IC_INSPECT_ROW_COST;
-    int c1 = dx1 * IC_INSPECT_COL_COST + dy1 * IC_INSPECT_ROW_COST;
-    return c0 < c1 ? c0 : c1;
-}
-
-// Somewhere near the expression for a label `want` cells wide.
-//
-// Rules 1-3 are taken outright. Failing all three, every row within
-// IC_INSPECT_SEARCH_ROWS -- including the hovered one -- is scanned and the
-// CHEAPEST fit wins, not the first that fits. Each row is scanned once into
-// maximal free runs rather than probed per offset: screen_to_pos is not free
-// and this runs every frame a label is up.
-//
-// The search is for a free run of want + 2*PAD and the text starts PAD into it.
-//
-// (ax0, ay0) is where the expression STARTS on screen and (ax1, ay1) the cell
-// its LAST character is on, both already FLOORED to the grid; they differ in y
-// only under word wrap. Floored because a sub-cell fraction would test one row
-// while the draw landed on the boundary between two.
-//
-// `focus_x` is what a label on another ROW is centred on: the middle of the
-// hovered TOKEN, which on a wide expression is not its start -- half a subtree
-// can sit between the two. Callers with no pointer to go on (a pin) pass the
-// middle of the expression instead. Cell coordinates, and a half-cell fraction
-// is meaningful: an even-width token has its middle on a cell boundary.
-//
-// `rows` is the block's height and (*out_x, *out_y) its top row. Each rule
-// reasons about the block's row nearest the expression, so a caption above
-// grows upwards and one below downwards.
-//
-// Returns the width available at (*out_x, *out_y): `want` when something
-// fitted, otherwise the widest gap found, which the caller truncates into --
-// one row only; a taller block that does not fit returns 0. 0 also when there
-// is nowhere usable.
-static int ic_inspect_place(InteractiveCoding *ic, UIContext *ui, UITextArea *ta,
-                            float ax0, float ay0, float ax1, float ay1,
-                            float focus_x, int want, int rows, float *out_x, float *out_y) {
-    // Ideally aligned with the expression itself.
-    float pref_x = ax0;
-
-    // Its two ends as column offsets from pref_x, which every distance below is
-    // measured against. 0 for a single-character expression.
-    int tail_dx = (int)(ax1 - ax0);
-    if (tail_dx < 0) tail_dx = 0;
-
-    int need = want + 2 * IC_INSPECT_PAD;
-
-    // Where the TEXT starts when the label is centred on the focus: its own
-    // middle over that cell, rounded so the two halves differ by at most one.
-    int center_tx = (int)m_floor((double)(focus_x - pref_x)
-                                 - (double)(want - 1) * 0.5 + 0.5);
-
-    // What a reader travels to reach a label whose TEXT starts at tx, sy.
-    #define IC_INS_COST(tx, sy)                                                     \
-        ic_inspect_min_cost((tx), (sy), tail_dx, ay0, ay1, center_tx)
-
-    float ry = (float)(rows - 1);
-
-    // ---- rule 1: the end of the expression's own line ----
-    {
-        int st;
-        if (ic_inspect_row_tail(ic, ui, ta, pref_x, ay1, rows, need, &st)) {
-            int tx = st + IC_INSPECT_PAD;
-            // Plain columns: the reach counts characters, not rule 4's cost.
-            int dl = tx < 0 ? -tx : tx;
-            int dr = tx - tail_dx; if (dr < 0) dr = -dr;
-            if ((dr < dl ? dr : dl) <= IC_INSPECT_EOL_REACH) {
-                *out_x = pref_x + (float)tx;
-                *out_y = ay1;
-                return want;
-            }
-        }
-    }
-
-    // The two rows a caption can go on, above first: a reading over the token
-    // is read before the code it belongs to, one under it after.
-    float adj[2] = { ay0 - 1.0f - ry, ay1 + 1.0f };
-
-    // ---- rule 2: centred on the token, on the row above or below ----
-    // A blank row is fine here, unlike rule 3 -- centred on the token it is not
-    // the middle of nowhere, it is directly over or under what it reads.
-    for (int t = 0; t < 2; t++) {
-        int st = center_tx - IC_INSPECT_PAD, fits = 1;
-        for (int c = st; c < st + need; c++) {
-            if (!ic_inspect_cell_free(ic, ui, ta, pref_x + (float)c, adj[t], rows)) {
-                fits = 0;
-                break;
-            }
-        }
-        if (!fits) continue;
-        *out_x = pref_x + (float)center_tx;
-        *out_y = adj[t];
-        return want;
-    }
-
-    // ---- rule 3: the end of the row above, then of the row below ----
-    for (int t = 0; t < 2; t++) {
-        int st;
-        if (!ic_inspect_row_tail(ic, ui, ta, pref_x, adj[t], rows, need, &st)) continue;
-        int tx = st + IC_INSPECT_PAD;
-        // Plain columns, and from the centre rule 2 wanted: what matters on
-        // another row is how far the label sits from the TOKEN.
-        int d = tx - center_tx; if (d < 0) d = -d;
-        if (d > IC_INSPECT_EOL_REACH_ADJ) continue;
-        *out_x = pref_x + (float)tx;
-        *out_y = adj[t];
-        return want;
-    }
-
-    // ---- rule 4: the cheapest gap anywhere nearby ----
-    int   best_cost = -1;                 // < 0 = nothing fits yet
-    float best_x = 0, best_y = 0;
-    int   wide_len = 0, wide_cost = 0;    // widest partial, for truncation
-    float wide_x = 0, wide_y = 0;
-
-    for (int dy = -IC_INSPECT_SEARCH_ROWS - (rows - 1); dy <= IC_INSPECT_SEARCH_ROWS; dy++) {
-        float sy = ay0 + (float)dy;
-
-        // The block's row nearest the expression, which is what it costs.
-        float near_y = sy, near_d = -1.0f;
-        for (int k = 0; k < rows; k++) {
-            float ky = sy + (float)k;
-            float d  = ky < ay0 ? ay0 - ky : (ky > ay1 ? ky - ay1 : 0.0f);
-            if (near_d < 0.0f || d < near_d) { near_y = ky; near_d = d; }
-        }
-
-        int c = -IC_INSPECT_SEARCH_COLS;
-        while (c <= IC_INSPECT_SEARCH_COLS) {
-            if (!ic_inspect_cell_free(ic, ui, ta, pref_x + (float)c, sy, rows)) { c++; continue; }
-            int run_start = c;
-            while (c <= IC_INSPECT_SEARCH_COLS &&
-                   ic_inspect_cell_free(ic, ui, ta, pref_x + (float)c, sy, rows)) c++;
-            int run_len = c - run_start;
-
-            if (run_len >= need) {
-                // `st` starts the PADDED block and the text lands PAD cells
-                // into it, so the ideal `st` is the ideal TEXT offset less PAD.
-                // On the expression's own row(s) that offset is 0, aligning the
-                // label on its START -- the nearer-end rule picks WHICH row,
-                // not where on it. Off them it is rule 2's centre.
-                int own = (near_y == ay0 || near_y == ay1);
-                int lo = run_start, hi = run_start + run_len - need;
-                int st = (own ? 0 : center_tx) - IC_INSPECT_PAD;
-                if (st < lo) st = lo;
-                if (st > hi) st = hi;
-
-                // The TEXT's offset -- the distance a reader actually sees.
-                int tx = st + IC_INSPECT_PAD;
-
-                int cost = IC_INS_COST(tx, near_y);
-                if (best_cost < 0 || cost < best_cost) {
-                    best_cost = cost;
-                    best_x = pref_x + (float)st;
-                    best_y = sy;
-                }
-            } else if (rows == 1) {
-                int cost = IC_INS_COST(run_start + IC_INSPECT_PAD, sy);
-                if (run_len > wide_len || (run_len == wide_len && cost < wide_cost)) {
-                    wide_len = run_len; wide_cost = cost;
-                    wide_x = pref_x + (float)run_start;
-                    wide_y = sy;
-                }
-            }
-        }
-    }
-    #undef IC_INS_COST
-
-    if (best_cost >= 0) {
-        *out_x = best_x + (float)IC_INSPECT_PAD;
-        *out_y = best_y;
-        return want;
-    }
-
-    // The widest gap found, less the padding it also has to hold.
-    int avail = wide_len - 2 * IC_INSPECT_PAD;
-    if (avail >= IC_INSPECT_MIN_CHARS) {
-        *out_x = wide_x + (float)IC_INSPECT_PAD;
-        *out_y = wide_y;
-        return avail;
-    }
-    return 0;
-}
-
-// A tall block is not a caption: it sits BESIDE the expression, its middle row
-// on the row the expression ends on. It may shift up or down, but only so far
-// that one of its rows stays on that row, and only when that brings it at least
-// IC_INSPECT_SHIFT_COLS columns nearer. The cheapest fit wins, by distance from
-// the text's start to the nearer end of the expression. Returns `want`, or 0
-// when nothing fits -- a tall block is never truncated.
-static int ic_inspect_place_beside(InteractiveCoding *ic, UIContext *ui, UITextArea *ta,
-                                   float ax0, float ax1, float ay1, int want, int rows,
-                                   float *out_x, float *out_y) {
-    float pref_x = ax0;
-    int tail_dx = (int)(ax1 - ax0);
-    if (tail_dx < 0) tail_dx = 0;
-    int need = want + 2 * IC_INSPECT_PAD;
-    int mid  = (rows - 1) / 2;
-
-    int best_cost = -1;
-    float best_x = 0, best_y = 0;
-    // k is the block row on ay1: centred first, then above, then below, so a
-    // tie keeps the earlier.
-    for (int i = 0; i < rows; i++) {
-        int k = i == 0 ? mid : (i <= mid ? mid + i : mid - (i - mid));
-        if (k < 0 || k >= rows) continue;
-        int shift = k > mid ? k - mid : mid - k;
-        float sy = ay1 - (float)k;
-
-        int c = -IC_INSPECT_SEARCH_COLS;
-        while (c <= IC_INSPECT_SEARCH_COLS) {
-            if (!ic_inspect_cell_free(ic, ui, ta, pref_x + (float)c, sy, rows)) { c++; continue; }
-            int run_start = c;
-            while (c <= IC_INSPECT_SEARCH_COLS &&
-                   ic_inspect_cell_free(ic, ui, ta, pref_x + (float)c, sy, rows)) c++;
-            int lo = run_start, hi = c - need;
-            if (hi < lo) continue;
-
-            int ends[2] = { 0, tail_dx };
-            for (int e = 0; e < 2; e++) {
-                int st = ends[e] - IC_INSPECT_PAD;
-                if (st < lo) st = lo;
-                if (st > hi) st = hi;
-                int tx = st + IC_INSPECT_PAD;
-                int d0 = tx < 0 ? -tx : tx;
-                int d1 = tx - tail_dx; if (d1 < 0) d1 = -d1;
-                int cost = (d0 < d1 ? d0 : d1) + shift * IC_INSPECT_SHIFT_COLS;
-                if (best_cost < 0 || cost < best_cost) {
-                    best_cost = cost;
-                    best_x = pref_x + (float)tx;
-                    best_y = sy;
-                }
-            }
-        }
-    }
-    if (best_cost < 0) return 0;
-    *out_x = best_x;
-    *out_y = best_y;
-    return want;
-}
+// Name catalog, call context, argument hint, comma readings and Tab completion.
+#include "ic_complete.c"
 
 // The middle of the TOKEN under (row, col), in screen cells, for placement to
 // centre a caption on. The token is the run of characters around that cell
@@ -2227,181 +1955,6 @@ static bool ic_inspect_token_focus(ICEditor *ed, int row, int col, ASTNode *node
     return true;
 }
 
-// Split a copy of a label into its rows where ic_inspect_split says, the same
-// cuts ic_inspect_place_label measured. Returns the row count.
-static int ic_inspect_label_rows(char *draw, int rows, char **out) {
-    int cuts[2];
-    out[0] = draw;
-    if (rows < 2 || ic_inspect_split(draw, rows, cuts) < 0) return 1;
-    for (int k = 0; k < rows - 1; k++) {
-        draw[cuts[k]] = '\0';
-        out[k + 1] = draw + cuts[k] + 1;
-    }
-    return rows;
-}
-
-// Claim the cells a label and its padding cover, a rect per row, so the next
-// label this frame treats them as occupied. Painted by ic_inspect_flush_labels
-// once every label is placed, so two that touch can still be pulled apart.
-// `ay1` is the row the expression ends on.
-static void ic_inspect_claim_label(InteractiveCoding *ic, const char *label, float x, float y,
-                                   int avail, int rows, bool pinned, float ay1) {
-    if (avail <= 0 || ic->ins_num_placed >= IC_INSPECT_MAX_SITES) return;
-    if (ic->ins_num_drawn + 3 > 3 * IC_INSPECT_MAX_SITES) return;
-    char draw[sizeof(ic->ins_sites[0].label)];
-    s_strncpy(draw, label, sizeof(draw) - 1);
-    draw[sizeof(draw) - 1] = '\0';
-    char *row[3];
-    int n = ic_inspect_label_rows(draw, rows, row);
-
-    ICInspectPlaced *p = &ic->ins_placed[ic->ins_num_placed++];
-    p->label  = label;
-    p->x      = x;
-    p->y      = y;
-    p->ay1    = ay1;
-    p->avail  = avail;
-    p->rows   = n;
-    p->pinned = pinned;
-    p->r0     = ic->ins_num_drawn;
-    for (int k = 0; k < n; k++) {
-        int len = (int)s_strlen(row[k]);
-        if (avail < len) len = ic_inspect_truncate(row[k], avail);
-        // Padding claimed with the text -- see ic_inspect_cell_kind. A row cut
-        // to nothing claims no cell.
-        ICInspectRect *r = &ic->ins_drawn[ic->ins_num_drawn++];
-        r->x   = x - (float)IC_INSPECT_PAD;
-        r->y   = y + (float)k;
-        r->len = len > 0 ? len + 2 * IC_INSPECT_PAD : 0;
-    }
-}
-
-// A placed label's text as an inclusive box, and its cell count. False when it
-// claims no cell.
-static bool ic_inspect_placed_box(InteractiveCoding *ic, const ICInspectPlaced *p,
-                                  int *x0, int *x1, int *y0, int *y1, int *cells) {
-    int w = 0, sum = 0;
-    for (int k = 0; k < p->rows; k++) {
-        int len = ic->ins_drawn[p->r0 + k].len - 2 * IC_INSPECT_PAD;
-        if (len <= 0) continue;
-        if (len > w) w = len;
-        sum += len;
-    }
-    if (w <= 0) return false;
-    *x0 = (int)p->x; *x1 = (int)p->x + w - 1;
-    *y0 = (int)p->y; *y1 = (int)p->y + p->rows - 1;
-    if (cells) *cells = sum;
-    return true;
-}
-
-// No blank row or column between two labels, corners included.
-static bool ic_inspect_placed_touch(InteractiveCoding *ic, const ICInspectPlaced *a,
-                                    const ICInspectPlaced *b) {
-    int ax0, ax1, ay0, ay1, bx0, bx1, by0, by1;
-    if (!ic_inspect_placed_box(ic, a, &ax0, &ax1, &ay0, &ay1, NULL)) return false;
-    if (!ic_inspect_placed_box(ic, b, &bx0, &bx1, &by0, &by1, NULL)) return false;
-    int gx = (ax0 > bx0 ? ax0 : bx0) - (ax1 < bx1 ? ax1 : bx1) - 1;
-    int gy = (ay0 > by0 ? ay0 : by0) - (ay1 < by1 ? ay1 : by1) - 1;
-    return gx <= 0 && gy <= 0;
-}
-
-// Shift placed label `i` by `dy` rows, when every cell it and its padding would
-// cover is free and it would touch no other label there. A three-row block
-// keeps a row on its expression's (see ic_inspect_place_beside).
-static bool ic_inspect_placed_move(InteractiveCoding *ic, UIContext *ui, UITextArea *ta,
-                                   int i, int dy) {
-    ICInspectPlaced *p = &ic->ins_placed[i];
-    ICInspectRect   *r = &ic->ins_drawn[p->r0];
-    float oy = p->y, ny = p->y + (float)dy;
-    if (p->rows == 3 && (p->ay1 < ny || p->ay1 > ny + 2.0f)) return false;
-
-    // Out of its own way while its new cells are tested.
-    int lens[3];
-    for (int k = 0; k < p->rows; k++) { lens[k] = r[k].len; r[k].len = 0; }
-    bool ok = true;
-    for (int k = 0; k < p->rows && ok; k++)
-        for (int c = 0; c < lens[k] && ok; c++)
-            ok = ic_inspect_cell_kind(ic, ui, ta, r[k].x + (float)c, ny + (float)k) == IC_CELL_FREE;
-    for (int k = 0; k < p->rows; k++) r[k].len = lens[k];
-    if (!ok) return false;
-
-    p->y = ny;
-    for (int k = 0; k < p->rows; k++) r[k].y = ny + (float)k;
-    for (int j = 0; j < ic->ins_num_placed && ok; j++)
-        if (j != i && ic_inspect_placed_touch(ic, p, &ic->ins_placed[j])) ok = false;
-    if (ok) return true;
-    p->y = oy;
-    for (int k = 0; k < p->rows; k++) r[k].y = oy + (float)k;
-    return false;
-}
-
-// Two labels stacked with no row between them read as one. The smaller moves a
-// row away from the other -- the later of a tie, which is the hover -- and
-// failing that the larger moves the other way.
-static void ic_inspect_separate_labels(InteractiveCoding *ic, UIContext *ui, UITextArea *ta) {
-    for (int i = 0; i < ic->ins_num_placed; i++) {
-        for (int j = i + 1; j < ic->ins_num_placed; j++) {
-            ICInspectPlaced *a = &ic->ins_placed[i], *b = &ic->ins_placed[j];
-            int ax0, ax1, ay0, ay1, bx0, bx1, by0, by1, na, nb;
-            if (!ic_inspect_placed_box(ic, a, &ax0, &ax1, &ay0, &ay1, &na)) continue;
-            if (!ic_inspect_placed_box(ic, b, &bx0, &bx1, &by0, &by1, &nb)) continue;
-            if (ay0 <= by1 && by0 <= ay1) continue;          // side by side, not stacked
-            if (!ic_inspect_placed_touch(ic, a, b)) continue;
-            int s = na < nb ? i : j, l = s == i ? j : i;
-            int dy = ic->ins_placed[s].y < ic->ins_placed[l].y ? -1 : 1;
-            if (!ic_inspect_placed_move(ic, ui, ta, s, dy))
-                ic_inspect_placed_move(ic, ui, ta, l, -dy);
-        }
-    }
-}
-
-// Separate, then paint, every label claimed this frame.
-static void ic_inspect_flush_labels(InteractiveCoding *ic, UIContext *ui, UITextArea *ta) {
-    if (ta) ic_inspect_separate_labels(ic, ui, ta);
-    for (int i = 0; i < ic->ins_num_placed; i++) {
-        ICInspectPlaced *p = &ic->ins_placed[i];
-        char draw[sizeof(ic->ins_sites[0].label)];
-        s_strncpy(draw, p->label, sizeof(draw) - 1);
-        draw[sizeof(draw) - 1] = '\0';
-        char *row[3];
-        int n = ic_inspect_label_rows(draw, p->rows, row);
-        // Green for a pin, comment-colour for the transient hover reading.
-        unsigned int col = p->pinned ? COL_INSPECT(ui) : COL_COMMENT(ui);
-        for (int k = 0; k < n; k++) {
-            int len = (int)s_strlen(row[k]);
-            if (p->avail < len && ic_inspect_truncate(row[k], p->avail) <= 0) continue;
-            for (int c = 0; row[k][c]; c++)
-                ui_draw_cell_flags_weight(ui, p->x + (float)c, p->y + (float)k,
-                                          (unsigned char)row[k][c], col, 0, ui->global_weight);
-        }
-    }
-    ic->ins_num_placed = 0;
-}
-
-// ic_inspect_place for a whole label. One past IC_INSPECT_SPLIT3_LEN first
-// tries a three-row block a third as wide beside the expression (see
-// ic_inspect_place_beside), then one past IC_INSPECT_SPLIT_LEN a
-// two-row block half as wide, split between values; failing those it is one
-// row as before, truncated into the widest gap if it must be.
-static int ic_inspect_place_label(InteractiveCoding *ic, UIContext *ui, UITextArea *ta,
-                                  float ax0, float ay0, float ax1, float ay1, float focus_x,
-                                  const char *label, float *out_x, float *out_y, int *out_rows) {
-    int len = (int)s_strlen(label);
-    *out_rows = 1;
-    for (int rows = 3; rows >= 2; rows--) {
-        if (len <= (rows == 3 ? IC_INSPECT_SPLIT3_LEN : IC_INSPECT_SPLIT_LEN)) continue;
-        int cuts[2];
-        int w = ic_inspect_split(label, rows, cuts);
-        if (w <= 0) continue;
-        int got = rows == 3 ? ic_inspect_place_beside(ic, ui, ta, ax0, ax1, ay1, w, rows, out_x, out_y)
-                            : ic_inspect_place(ic, ui, ta, ax0, ay0, ax1, ay1, focus_x, w, rows, out_x, out_y);
-        if (got == w) {
-            *out_rows = rows;
-            return w;
-        }
-    }
-    return ic_inspect_place(ic, ui, ta, ax0, ay0, ax1, ay1, focus_x, len, 1, out_x, out_y);
-}
-
 // ---- pin / unpin -----------------------------------------------------------
 
 // Rewrite the editor's buffer, keeping the view where the user left it --
@@ -2437,7 +1990,7 @@ static void ic_inspect_commit_text(InteractiveCoding *ic, ICEditor *ed,
     ic->ins_hover_valid = false;
     for (int i = 0; i < IC_INSPECT_MAX_SITES; i++) {
         ic->ins_sites[i].label[0] = '\0';
-        ic->ins_sites[i].placed   = 0;
+        ic->ins_sites[i].cache.placed   = 0;
     }
     ic->ins_num_sites  = 1;
     ic->ins_place_todo = 2;
@@ -2571,73 +2124,37 @@ static void ic_inspect_draw_pins(InteractiveCoding *ic, UIContext *ui, ICEditor 
 
     // A scrub's digit wheels move every frame and are painted just before
     // this, so a placement from before the drag can end up under one.
-    int forced = ic->ins_place_todo > 0 || ic->rc_drag_target != NULL;
+    ic->ov.force_place = ic->ins_place_todo > 0 || ic->rc_drag_target != NULL;
 
     for (int i = 1; i < ic->ins_num_sites; i++) {
         ICInspectSite *s = &ic->ins_sites[i];
-        if (s->label[0] == '\0' || s->row < 0) continue;
-
-        float ax, ay, ax2, ay2;
-        if (!ui_textarea_pos_to_screen(sed->ta, s->row, s->col, &ax, &ay)) {
-            s->placed = 0;              // scrolled out of view
-            continue;
-        }
-        ax = (float)m_floor(ax); ay = (float)m_floor(ay);
-        // The tail can be off-screen while the head is not. Falling back on
-        // the head keeps the pin drawn, measured start-only for that frame.
-        if (!ui_textarea_pos_to_screen(sed->ta, s->row2, s->col2, &ax2, &ay2)) {
-            ax2 = ax; ay2 = ay;
-        } else {
-            ax2 = (float)m_floor(ax2); ay2 = (float)m_floor(ay2);
-        }
-
-        if (!s->placed || forced || ax != s->place_ax || ay != s->place_ay ||
-            ax2 != s->place_ax2 || ay2 != s->place_ay2) {
-            s->place_ax  = ax;  s->place_ay  = ay;
-            s->place_ax2 = ax2; s->place_ay2 = ay2;
-            // Nothing is hovered, so a caption centres on the pin itself --
-            // its own middle, or its start when wrap has split it in two.
-            float focus = (ay2 == ay) ? (ax + ax2) * 0.5f : ax;
-            s->place_avail = ic_inspect_place_label(ic, ui, sed->ta, ax, ay, ax2, ay2, focus, s->label,
-                                                    &s->place_x, &s->place_y, &s->place_rows);
-            s->placed = 1;
-        }
-        ic_inspect_claim_label(ic, s->label, s->place_x, s->place_y, s->place_avail, s->place_rows, true, ay2);
+        ICOverlayLabel l = { IC_OV_PIN, s->label, NULL, s->row, s->col, s->row2, s->col2,
+                             -1.0f, -1, 0, 0, &s->cache };
+        ic_overlay_add(ic, ui, sed->ta, &l);
     }
+    ic->ov.force_place = 0;
     if (ic->ins_place_todo > 0) ic->ins_place_todo--;
 }
 
 static void ic_inspect_draw_hover(InteractiveCoding *ic, UIContext *ui, ICEditor *sed,
                                   bool have_focus, float focus_x) {
     ICInspectSite *h = &ic->ins_sites[IC_INSPECT_ID_HOVER];
-    if (h->label[0] == '\0' || h->row < 0) return;
-
-    float hx, hy, hx2, hy2;
-    if (!ui_textarea_pos_to_screen(sed->ta, h->row, h->col, &hx, &hy)) return;
-    hx = (float)m_floor(hx); hy = (float)m_floor(hy);
-    if (!ui_textarea_pos_to_screen(sed->ta, h->row2, h->col2, &hx2, &hy2)) {
-        hx2 = hx; hy2 = hy;               // tail scrolled off; measure from the head
-    } else {
-        hx2 = (float)m_floor(hx2); hy2 = (float)m_floor(hy2);
-    }
-
     // The pointer may be off the reading's own span (a retarget), or on a
     // token that scrolled since; the expression's middle is the fallback.
-    float focus = have_focus ? focus_x : ((hy2 == hy) ? (hx + hx2) * 0.5f : hx);
-
-    float x, y;
-    int rows;
-    int avail = ic_inspect_place_label(ic, ui, sed->ta, hx, hy, hx2, hy2, focus, h->label, &x, &y, &rows);
-    ic_inspect_claim_label(ic, h->label, x, y, avail, rows, false, hy2);
+    ICOverlayLabel l = { IC_OV_HOVER, h->label, NULL, h->row, h->col, h->row2, h->col2,
+                         have_focus ? focus_x : -1.0f, -1, 0, 0, NULL };
+    ic_overlay_add(ic, ui, sed->ta, &l);
 }
 
 void ic_update_inspect(InteractiveCoding *ic, UIContext *ui) {
     if (!ic || !ui) return;
-    ic->ins_num_drawn  = 0;
-    ic->ins_num_placed = 0;
     bool host_stale = ic->ins_stale;
     ic->ins_stale = false;
-    if (!ic_inspect_on(ic)) return;
+    if (!ic_inspect_on(ic)) {
+        // The host stops inspecting too.
+        if (ic->run_mode == IC_RUN_HOST) ic_inspect_publish(ic, ic->ins_ed, NULL, 0);
+        return;
+    }
 
     // A scrub owns the pointer, so there is no HOVER reading while one runs.
     // The PINS stay up and stay live -- ic_update_scrubber refreshes them,
@@ -2645,7 +2162,6 @@ void ic_update_inspect(InteractiveCoding *ic, UIContext *ui) {
     // here is to draw them.
     if (ic->rc_drag_target) {
         ic_inspect_draw_pins(ic, ui, ic->ins_ed);
-        ic_inspect_flush_labels(ic, ui, ic->ins_ed ? ic->ins_ed->ta : NULL);
         return;
     }
 
@@ -2685,6 +2201,7 @@ void ic_update_inspect(InteractiveCoding *ic, UIContext *ui) {
 
     // ---- what is under the pointer ----
     ASTNode *hover      = NULL;
+    ASTNode *raw        = NULL;     // the node under the pointer, before any retarget
     size_t   hover_off   = 0;
     float    focus_x     = 0;       // middle of the token under the pointer
     bool     have_focus  = false;
@@ -2705,7 +2222,7 @@ void ic_update_inspect(InteractiveCoding *ic, UIContext *ui) {
             hover_off = pr->line_offsets[mr - 1] + (size_t)mc;
         else hover = NULL;
 
-        ASTNode *raw = hover;
+        raw = hover;
         // From the token the pointer is ON, not the expression a retarget
         // moves the reading to: it is where the eye already is.
         have_focus = ic_inspect_token_focus(ed, mr, mc, raw, &focus_x);
@@ -2713,6 +2230,9 @@ void ic_update_inspect(InteractiveCoding *ic, UIContext *ui) {
         // A retarget moves the span off the pointer on purpose, so the anchor
         // check stands down for it.
         if (hover != raw) hover_off = IC_INSPECT_NO_ANCHOR;
+        // A comma with a reading of its own, and the open Tab menu, take the
+        // pointer's attention: no value reading beside them.
+        if (ic->cp.cmh_suppress || ic->cp.menu_open) hover = NULL;
     }
 
     // ---- the bump timer ----
@@ -2748,10 +2268,16 @@ void ic_update_inspect(InteractiveCoding *ic, UIContext *ui) {
     // is exactly as coarse as the run. Guarded on there being a reading on
     // screen at all: the run is a full parse+compile+execute, so merely having
     // the editor open must not cost a compile per frame.
+    //
+    // In host mode the arguments, and every value, are the host's: nothing to
+    // watch here.
     char args_now[IC_WRAP_ARGS_MAX];
-    ic_wrap_call_args(ic, sed, args_now, (int)sizeof(args_now));
+    args_now[0] = '\0';
+    bool host_run = ic->run_mode == IC_RUN_HOST;
+    if (!host_run) ic_wrap_call_args(ic, sed, args_now, (int)sizeof(args_now));
     bool have_reading = hover || ic->ins_num_sites > 1;
-    bool args_moved = have_reading && (host_stale || s_strcmp(args_now, ic->ins_wrap_args) != 0);
+    bool args_moved = !host_run && have_reading &&
+                      (host_stale || s_strcmp(args_now, ic->ins_wrap_args) != 0);
 
     if (hover != ic->ins_node || sed != ic->ins_ed ||
         sed->run_serial != ic->ins_run_serial || args_moved) {
@@ -2776,13 +2302,14 @@ void ic_update_inspect(InteractiveCoding *ic, UIContext *ui) {
     }
 
     // ---- the gesture ----
-    // number_flags CLEAR: a numeric literal belongs to the scrubber, which arms
-    // on the same field. Disjoint by construction, so neither consumes the
-    // button.
+    // number_flags CLEAR on the cell under the pointer: a numeric literal
+    // belongs to the scrubber, which arms on the same field. Disjoint by
+    // construction, so neither consumes the button. Tested on `raw`, not the
+    // retarget, so the name or `=` of `y = 5` still pins its literal rhs.
     // The pin rewrites the buffer, so the scrubber (armed later this frame)
     // could find a number under the pointer that was not there at the click.
     if (ed == sed && ui->mouse_pressed[UI_MOUSE_BUTTON_RIGHT] &&
-        hover && !hover->number_flags && ic_inspect_toggle_pin(ic, sed)) {
+        hover && raw && !raw->number_flags && ic_inspect_toggle_pin(ic, sed)) {
         ui_consume_mouse_press(ui, UI_MOUSE_BUTTON_RIGHT);
         return;
     }
@@ -2790,8 +2317,20 @@ void ic_update_inspect(InteractiveCoding *ic, UIContext *ui) {
     // Pins first: they are fixed, so the transient hover label is the one that
     // gives way when the two compete for a gap.
     ic_inspect_draw_pins(ic, ui, sed);
+    ic_complete_add_hint(ic, ui);
     if (ed == sed) ic_inspect_draw_hover(ic, ui, sed, have_focus, focus_x);
-    ic_inspect_flush_labels(ic, ui, sed->ta);
+}
+
+void ic_update_overlay(InteractiveCoding *ic, UIContext *ui) {
+    if (!ic || !ui) return;
+    ic_overlay_begin(ic);
+    ic_complete_input(ic, ui);
+    ic_complete_add_menu(ic, ui);
+    ic_update_inspect(ic, ui);
+    if (!ic->ov.hint_added) ic_complete_add_hint(ic, ui);
+    ic_complete_add_comma(ic, ui);
+    ic_overlay_flush(ic, ui);
+    ic_complete_draw_menu(ic, ui);
 }
 
 void ic_editor_update_gutter_toggle(InteractiveCoding *ic, UIContext *ui, UITextArea *ta) {
@@ -2873,9 +2412,9 @@ static size_t ic_inspect_result_lines(InteractiveCoding *ic, ICEditor *ped,
 void ic_format_result_with_outputs(InteractiveCoding *ic) {
     struct { const char *label; bool show; const char *text; } out[] = {
         { "C Code",   ic->show_c_code,   ic->c_code_output   },
-        { "CurlyWas", ic->show_curlywas, ic->curlywas_output },
         { "JS",       ic->show_js,       ic->js_output       },
         { "Lua",      ic->show_lua,      ic->lua_output      },
+        { "MicroW8",  ic->show_curlywas, ic->curlywas_output },
     };
     const int n_out = (int)(sizeof(out) / sizeof(out[0]));
 
@@ -2962,10 +2501,10 @@ bool interactive_coding_has_editor_focus(InteractiveCoding *ic) {
     // Also true for the results panel: the user can select and copy there, and
     // without this a host accelerator table steals Ctrl+C before it reaches
     // result_ta's handle_key().
-    if (ic->ui->focus_id == ui_id_from_ptr(ic->result_ta)) return true;
+    if (ui_textarea_has_focus(ic->ui, ic->result_ta)) return true;
     UITextArea *ta = ic_active_ta(ic);
     if (!ta) return false;
-    return ic->ui->focus_id == ui_id_from_ptr(ta);
+    return ui_textarea_has_focus(ic->ui, ta);
 }
 
 void interactive_coding_set_editor_focus(InteractiveCoding *ic) {
@@ -3099,35 +2638,44 @@ int ic_chrome_button_row(InteractiveCoding *ic, UIContext *ui, int x, int w,
         ui_same_line(ui);
     }
     bool auto_changed = ui_check_box(ui, "Auto-run", &ic->auto_run) != 0;
-    ui_same_line_pad(ui, 2);
-    ui_label(ui, "Show:");
     ui_same_line(ui);
-    bool show_c_changed = ui_check_box(ui, "C", &ic->show_c_code) != 0;
-    ui_same_line(ui);
-    bool show_js_changed = ui_check_box(ui, "JS", &ic->show_js) != 0;
-    ui_same_line(ui);
-    bool show_lua_changed = ui_check_box(ui, "Lua", &ic->show_lua) != 0;
-    // No CurlyWas box: the emitter is still reachable through ic->show_curlywas,
-    // but nothing on this row turns it on.
 
-    // Hover inspection, at the right end of the row -- it is not part of the
-    // "Show:" group. Right-aligned only when the row is wide enough to clear
-    // the Lua box, since a narrow pane would land on top of it.
+    bool show_c_changed, show_js_changed, show_lua_changed, show_mw8_changed;
+    {
+        static const char *const items[4] = { "C", "JS", "Lua", "MicroW8" };
+        bool shown[4] = { ic->show_c_code, ic->show_js, ic->show_lua, ic->show_curlywas };
+        // Own id per editor: meld and the accordion draw several of these rows.
+        ui_push_id_ptr(ui, ic);
+        int changed = ui_multi_dropdown(ui, "Preview", 4, items, shown, "None");
+        ui_pop_id(ui);
+        ic->show_c_code = shown[0]; ic->show_js = shown[1]; ic->show_lua = shown[2]; ic->show_curlywas = shown[3];
+        show_c_changed   = (changed & 1) != 0;
+        show_js_changed  = (changed & 2) != 0;
+        show_lua_changed = (changed & 4) != 0;
+        show_mw8_changed = (changed & 8) != 0;
+    }
+    const int flowed_w = (int)(ui->last_x + ui->last_w) - x;
+
+    // Editor aids, at the right end of the row -- not part of the "Preview"
+    // group. Right-aligned only when the row is wide enough to clear the
+    // Preview header, since a narrow pane would land on top of it.
     {
         // "Unpin" appears only once there is something to unpin.
         const bool has_pins  = (ic->ins_num_sites > 1);
         const int  kUnpinW   = has_pins ? 8 : 0;  // " [Unpin]"
-        const int  kInspectW = 11 + kUnpinW;      // "[ ] Inspect"
-        const int  kFlowedW  = 44;                // everything laid out above
-        if (w > kFlowedW + kInspectW + 2) ui_same_line_col(ui, w - kInspectW);
-        else                              ui_same_line_pad(ui, 2);
+        const int  kEditorW  = 24 + kUnpinW;      // "Editor: Hint, Inspect v"
+        if (w > flowed_w + kEditorW + 2) ui_same_line_col(ui, w - kEditorW + 6);
+        else                             ui_same_line_pad(ui, 2);
+        static const char *const aids[2] = { "Hint", "Inspect" };
         // Unchecked and greyed out while the host has ruled inspection out; the
         // user's own setting is left alone behind it.
-        bool shown = ic_inspect_on(ic);
-        if (!ic->inspect_available) ui_begin_disabled(ui);
-        if (ui_check_box(ui, "Inspect", &shown) && ic->inspect_available)
-            ic->hover_inspect = shown;
-        if (!ic->inspect_available) ui_end_disabled(ui);
+        bool on[2] = { ic->cp.hints, ic_inspect_on(ic) };
+        const bool off[2] = { false, !ic->inspect_available };
+        ui_push_id_ptr(ui, ic);
+        int aid_changed = ui_multi_dropdown_ex(ui, "Editor", 2, aids, on, NULL, UI_MULTI_CHECKBOXES, off);
+        ui_pop_id(ui);
+        ic->cp.hints = on[0];
+        if ((aid_changed & 2) && ic->inspect_available) ic->hover_inspect = on[1];
         // The gesture removes one pin; this removes them all.
         if (has_pins) {
             ui_same_line(ui);
@@ -3135,7 +2683,7 @@ int ic_chrome_button_row(InteractiveCoding *ic, UIContext *ui, int x, int w,
         }
     }
 
-    if (auto_changed || show_c_changed || show_js_changed || show_lua_changed) {
+    if (auto_changed || show_c_changed || show_js_changed || show_lua_changed || show_mw8_changed) {
         ic->result_dirty = true;
     }
 
@@ -3143,7 +2691,8 @@ int ic_chrome_button_row(InteractiveCoding *ic, UIContext *ui, int x, int w,
     // would look like the click did nothing. Ask for a run.
     if ((show_c_changed   && ic->show_c_code   && !ic->c_code_output)   ||
         (show_js_changed  && ic->show_js       && !ic->js_output)       ||
-        (show_lua_changed && ic->show_lua      && !ic->lua_output)) {
+        (show_lua_changed && ic->show_lua      && !ic->lua_output)      ||
+        (show_mw8_changed && ic->show_curlywas && !ic->curlywas_output)) {
         flags |= IC_BTN_RUN;
     }
     return flags;
@@ -3170,6 +2719,9 @@ static void ic_render_own_result(InteractiveCoding *ic) {
     } else if (ed->has_compile_error) {
         ic->result_is_error = true;
         s_snprintf(p, rem, "[Compile] %s\n", ed->compile_error);
+    } else if (ed->has_host_error) {
+        ic->result_is_error = true;
+        s_snprintf(p, rem, "[Host] %s\n", ed->host_error);
     } else if (ed->has_execute_error) {
         ic->result_is_error = true;
         s_snprintf(p, rem, "[Execute] %s\n", ed->execute_error);
@@ -3223,7 +2775,7 @@ void interactive_coding_frame_absolute_pos(InteractiveCoding *ic, UIContext *ui,
     // ---- Code area ----
     // Both overlays first, so they claim their cells before the textarea does.
     ic_update_scrubber(ic, ui);
-    ic_update_inspect(ic, ui);
+    ic_update_overlay(ic, ui);
 
     int ta_changed = ui_textarea_absolute_pos(ui, ic->freeform.ta, x, c.content_y, w, c.content_h);
     if (ic->freeform.pending_run || (ic->auto_run && ta_changed)) {
@@ -3265,6 +2817,7 @@ static void ic_editor_clear_run_state(InteractiveCoding *ic, ICEditor *ed) {
     ed->has_parse_error   = false;
     ed->has_compile_error = false;
     ed->has_execute_error = false;
+    ed->has_host_error    = false;
     ed->execute_error[0]  = '\0';
     s_snprintf(ed->result, sizeof(ed->result), "(not run)");
     ed->result_is_error = false;
@@ -3442,6 +2995,156 @@ char *interactive_coding_get_text(InteractiveCoding *ic) {
 
 bool interactive_coding_is_scrubbing(InteractiveCoding *ic) {
     return ic && ic->rc_drag_target != NULL;
+}
+
+// ===========================================================================
+// Host-run mode
+// ===========================================================================
+
+void interactive_coding_set_run_mode(InteractiveCoding *ic, ICRunMode mode) {
+    if (!ic || ic->run_mode == mode) return;
+    // Leaving host mode, the host stops inspecting.
+    if (ic->run_mode == IC_RUN_HOST) ic_inspect_publish(ic, ic->ins_ed, NULL, 0);
+    ic->run_mode = mode;
+    ic_inspect_forget(ic);
+    ic->ins_ed = NULL;
+    for (int i = 0; i < ic->num_editors; i++) {
+        ICEditor *ed = ic->editors[i];
+        ic_editor_clear_run_state(ic, ed);
+        ed->host_serial = 0;
+        ed->needs_parse = true;
+        ed->pending_run = true;
+    }
+}
+
+ICRunMode interactive_coding_get_run_mode(InteractiveCoding *ic) {
+    return ic ? ic->run_mode : IC_RUN_LOCAL;
+}
+
+void interactive_coding_set_local_check(InteractiveCoding *ic, bool on) {
+    if (!ic || ic->local_check == on) return;
+    ic->local_check = on;
+    if (!on) {
+        ICEditor *ed = ic_active_editor(ic);
+        if (ed) ed->has_compile_error = false;
+        ic_clear_emitted_outputs(ic);
+        ic->result_dirty = true;
+    }
+}
+
+void interactive_coding_set_code_changed_callback2(
+    InteractiveCoding *ic, InteractiveCodingCodeChanged2Fn cb, void *user) {
+    if (!ic) return;
+    ic->on_code_changed2 = cb;
+    ic->on_code_changed2_user = user;
+}
+
+void interactive_coding_set_probes_changed_callback(
+    InteractiveCoding *ic, InteractiveCodingProbesChangedFn cb, void *user) {
+    if (!ic) return;
+    ic->on_probes_changed = cb;
+    ic->on_probes_changed_user = user;
+}
+
+int interactive_coding_get_probes(InteractiveCoding *ic, ICProbe *out, int max,
+                                  unsigned *probe_serial) {
+    if (!ic) return 0;
+    if (probe_serial) *probe_serial = ic->ins_probe_serial;
+    int n = ic->ins_num_probes;
+    for (int i = 0; i < n && i < max && out; i++) out[i] = ic->ins_probes[i];
+    return n;
+}
+
+void interactive_coding_host_begin(InteractiveCoding *ic, unsigned code_serial) {
+    if (!ic) return;
+    ICEditor *ed = ic_active_editor(ic);
+    // Newest wins, never "current only": a host is always behind a scrub drag.
+    ic->host_ed = ed;
+    ic->host_ok = ed && ic->run_mode == IC_RUN_HOST &&
+                  (ed->host_serial == 0 || (int)(code_serial - ed->host_serial) >= 0);
+    if (!ic->host_ok) return;
+    ed->host_serial       = code_serial;
+    ed->has_host_error    = false;
+    ed->host_error[0]     = '\0';
+    ed->host_error_row    = ed->host_error_col = -1;
+    ed->has_execute_error = false;
+    ed->execute_error[0]  = '\0';
+    ic_print_reset(ed);
+}
+
+void interactive_coding_host_error(InteractiveCoding *ic, int stage, int row, int col,
+                                   const char *msg) {
+    if (!ic || !ic->host_ok || !ic->host_ed) return;
+    ICEditor *ed = ic->host_ed;
+    msg = msg ? strip_vm_pos_prefix(msg) : "error";
+    if (stage == IC_HOST_RUN) {
+        if (ed->has_execute_error) return;   // the first one is the one that stopped it
+        ed->has_execute_error = true;
+        s_snprintf(ed->execute_error, sizeof(ed->execute_error), "Error: %s", msg);
+        return;
+    }
+    if (ed->has_host_error) return;
+    ed->has_host_error = true;
+    ed->host_error_row = row;
+    ed->host_error_col = col;
+    const char *what = stage == IC_HOST_PARSE ? "Parse" : "Compile";
+    if (row >= 0 && col >= 0)
+        s_snprintf(ed->host_error, sizeof(ed->host_error), "%s error at %d:%d: %s", what, row + 1, col + 1, msg);
+    else
+        s_snprintf(ed->host_error, sizeof(ed->host_error), "%s error: %s", what, msg);
+}
+
+void interactive_coding_host_result(InteractiveCoding *ic, const char *text) {
+    if (!ic || !ic->host_ok || !ic->host_ed || ic->host_ed->has_execute_error) return;
+    s_snprintf(ic->host_ed->execute_error, sizeof(ic->host_ed->execute_error), "%s", text ? text : "");
+}
+
+void interactive_coding_host_print(InteractiveCoding *ic, const unsigned char *s, int n) {
+    if (!ic || !ic->host_ok || !ic->host_ed || !s || n < 0) return;
+    ic_print_sink(ic->host_ed, s, n);
+}
+
+void interactive_coding_host_end(InteractiveCoding *ic) {
+    if (!ic) return;
+    ICEditor *ed = ic->host_ed;
+    bool ok = ic->host_ok;
+    ic->host_ok = false;
+    ic->host_ed = NULL;
+    if (!ok || !ed) return;
+    if (!ed->has_parse_error && !ed->has_compile_error) ic_host_error_bg(ed);
+    ic_editor_store_result(ic, ed);
+    ic->result_dirty = true;
+}
+
+void interactive_coding_inspect_begin(InteractiveCoding *ic, unsigned probe_serial) {
+    if (!ic) return;
+    ic->ins_pass_ok = ic->run_mode == IC_RUN_HOST && ic_inspect_on(ic) && ic->ins_ed &&
+                      probe_serial == ic->ins_probe_serial;
+    if (!ic->ins_pass_ok) return;
+    for (int i = 0; i < ic->ins_num_sites; i++) ic_inspect_reset(&ic->ins_sites[i].stats);
+}
+
+void interactive_coding_inspect_value(InteractiveCoding *ic, int id, int kind, int fx_shift, double v) {
+    if (ic && ic->ins_pass_ok) ic_inspect_sink(ic, id, kind, fx_shift, v);
+}
+
+void interactive_coding_inspect_array(InteractiveCoding *ic, int id, int kind, int fx_shift,
+                                      int total, const double *vals, int n) {
+    if (ic && ic->ins_pass_ok) ic_inspect_arr_sink(ic, id, kind, fx_shift, total, vals, n);
+}
+
+void interactive_coding_inspect_sigs(InteractiveCoding *ic, int id, const char *labels) {
+    if (!ic || !ic->ins_pass_ok || id != IC_INSPECT_ID_HOVER || !ic->ins_hover_sig) return;
+    s_snprintf(ic->ins_sites[0].label, sizeof(ic->ins_sites[0].label), "%s", labels ? labels : "");
+}
+
+void interactive_coding_inspect_end(InteractiveCoding *ic) {
+    if (!ic || !ic->ins_pass_ok) return;
+    ic->ins_pass_ok = false;
+    ic_inspect_format_sites(ic);
+    for (int i = 0; i < ic->ins_num_sites; i++) ic->ins_sites[i].cache.placed = 0;
+    ic->ins_place_todo = 2;
+    if (ic->ins_num_sites > 1) ic->result_dirty = true;
 }
 
 #endif

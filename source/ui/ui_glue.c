@@ -166,3 +166,33 @@ int ui_glue_draw_grade_lineh(UIContext *ui, float *line_height,
     ui_pop_item_width(ui);
     return changed;
 }
+
+int ui_glue_draw_view_panel(UIContext *ui, float *line_height,
+                            float lineh_min, float lineh_middle, float lineh_max,
+                            int *font_index, const char *const font_names[], int font_count) {
+    int changed = 0;
+    if (ui_dropdown_panel_begin(ui, "Theme", (const char *)0, UI_DROPDOWN_HIDE_SELECTION, 0.0f, 0.0f, UI_POPUP_PLAIN_BG | UI_POPUP_BORDER)) {
+        if (font_index) changed |= ui_option_bar(ui, "Font", font_index, font_count, font_names, 0);
+        ui_push_item_width(ui, 21);
+        ui_push_label_width(ui, 7);
+        changed |= ui_slider(ui, "Grade", &ui->global_weight, 0.3f, 1.0f, 2.0f);
+        changed |= ui_slider(ui, "LineH", line_height, lineh_min, lineh_middle, lineh_max);
+        changed |= ui_slider(ui, "Black", &ui->theme_black_point,
+                             0.0f, UI_THEME_BLACK_POINT_DEFAULT, UI_GLUE_BLACK_POINT_MAX);
+        changed |= ui_slider(ui, "Text", &ui->theme_text_intensity,
+                             UI_GLUE_TEXT_INTENSITY_MIN, UI_THEME_TEXT_INTENSITY_DEFAULT,
+                             UI_GLUE_TEXT_INTENSITY_MAX);
+        ui_pop_label_width(ui);
+        if (ui_button(ui, "Reset")) {
+            ui->global_weight        = 1.0f;
+            *line_height             = lineh_middle;
+            ui->theme_black_point    = UI_THEME_BLACK_POINT_DEFAULT;
+            ui->theme_text_intensity = UI_THEME_TEXT_INTENSITY_DEFAULT;
+            if (font_index) *font_index = 0;
+            changed = 1;
+        }
+        ui_pop_item_width(ui);
+        ui_dropdown_panel_end(ui);
+    }
+    return changed;
+}

@@ -305,6 +305,24 @@ static inline double ic_ins_round_fx(double v) {
     return (double)r / IC_INSPECT_FX_ROUND;
 }
 
+// ic_ins_round_fx spelled straight from the rounded integer. Dividing back to a
+// double and printing that breaks under -ffast-math (the wasm builds): r / 1000.0
+// becomes r * 0.001, 1001 * 0.001 is 1.0010000000000001, and SHORTEST prints it.
+// Same range and same text as round + pad. Returns 0 when v is out of range.
+static inline int ic_ins_fixed3(double v, char *dst, int dst_size) {
+    double a = v < 0 ? -v : v;
+    if (!(a >= 1.0 / IC_INSPECT_FX_ROUND) || !(a < 1e12)) return 0;
+    long long r = (long long)(a * IC_INSPECT_FX_ROUND + 0.5);
+    int len = 0;
+    if (v < 0) ic_ins_append(dst, dst_size, &len, "-");
+    ic_ins_append_ll(dst, dst_size, &len, r / 1000);
+    int f = (int)(r % 1000);
+    char frac[6] = { '.', '0', '\0', '\0', '\0', '\0' };
+    if (f) { frac[1] = (char)('0' + f / 100); frac[2] = (char)('0' + f / 10 % 10); frac[3] = (char)('0' + f % 10); }
+    ic_ins_append(dst, dst_size, &len, frac);
+    return len;
+}
+
 // The rounded reading padded out to IC_INSPECT_FX_DIGITS, so a row of them
 // lines up and reads as one precision: 1.2 becomes 1.200 beside 33.550.
 //
@@ -352,6 +370,10 @@ static inline int ic_ins_num(double v, int kind, int shift, char *dst, int dst_s
     }
     char num[S_FROM_NUMBER_MAX_CHARS];
     int real = kind == VMT_F32 || kind == VMT_F64 || shift > 0;
+    if (real && kind != VMT_F32) {
+        len = ic_ins_fixed3(v, dst, dst_size);
+        if (len) return len;
+    }
     if (real) v = ic_ins_round_fx(v);
     s_from_number_flags(v, num, kind == VMT_F32 ? 0 : S_FROM_NUMBER_FLAG_SHORTEST);
 

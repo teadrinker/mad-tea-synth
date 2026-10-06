@@ -547,7 +547,7 @@ static void lowspec_cache_blit(const FONT_CACHE_LOWSPEC *c, int off,
 
 #if USE_UNIFIED_BLEND
     // Mode and alpha resolved once for the whole glyph.
-    RBlend rbl = rb_make(blend, -1, alpha);
+    RBlend rbl = RB_MAKE(surf, blend, -1, alpha);
 #else
     int inverted = rs_blend_inverted(blend);
     // 0-255 coverage multiplier; 255 skips the multiply, so a full-strength
@@ -578,12 +578,8 @@ static void lowspec_cache_blit(const FONT_CACHE_LOWSPEC *c, int off,
             // stores goes straight in. Dither indexes ABSOLUTE (x, y) -- both
             // are already in destination space here, which is what keeps a
             // moving glyph from crawling through the pattern.
-  #if RS_PEBBLE_TIME2
-            if (!rbl.gray8) dst[x] = rb_px(&rbl, dst[x], cov, RB_DITHER_AT(x, y));
+            if (!rbl.gray8) dst[x] = RB_PX_A(&rbl, dst[x], cov, x, y);
             else            dst[x] = rb_px_gray(&rbl, dst[x], cov);
-  #else
-            dst[x] = rb_px_gray(&rbl, dst[x], cov);
-  #endif
 #else
             if (alpha255 != 255) cov = (cov * alpha255) / 255;
             int gray  = rs_gray_of_b(dst[x], blend);
@@ -666,6 +662,10 @@ void render_glyph_lowspec_ascii(const FONT_LOWSPEC *font,
     // A glyph drawn into an 8-bit image renders the long way so it keeps every
     // level; the screen keeps its cache.
     int cacheable = (flags & RG_FLAGS_RENDER_LINE_OUTLINE) == 0 && !rs_blend_gray8(blend);
+#if RB_LAYOUTS
+    // Same reason for a runtime layout with more than 4 levels a channel.
+    if (surf->layout && (surf->layout->gray8 || surf->layout->max_bits > 2)) cacheable = 0;
+#endif
 
     // Tile = the scaled glyph box (hsize is a half-extent) + pad each side,
     // rounded up so a fractional box never loses its last column/row.
@@ -1086,7 +1086,9 @@ void render_rect(const RSurface *surf, fx16 x, fx16 y, fx16 w, fx16 h, int col, 
     unsigned char c = (unsigned char)(col & 0xFF);
     int inverted = rs_blend_inverted(blend);
     int gray8    = rs_blend_gray8(blend);
-#if !RS_PEBBLE_TIME2
+#if RB_LAYOUTS
+    if (!surf->layout || surf->layout->gray8) gray8 = 1;
+#elif !RS_PEBBLE_TIME2
     (void)gray8;   // this build's byte IS an 8-bit gray, so the flag changes nothing
 #endif
 
@@ -1097,6 +1099,8 @@ void render_rect(const RSurface *surf, fx16 x, fx16 y, fx16 w, fx16 h, int col, 
     int masked = 0;
 #if USE_UNIFIED_BLEND && RS_PEBBLE_TIME2
     masked = !gray8 && rs_blend_chanmask(blend) != 0xFF;
+#elif RB_LAYOUTS
+    masked = !gray8 && rlayout_locked_bits(surf->layout, rs_blend_flags(blend)) != 0;
 #endif
 
     if (alpha >= FX16_ONE && !inverted && !masked) {  // fast path: write col verbatim
@@ -1129,13 +1133,13 @@ void render_rect(const RSurface *surf, fx16 x, fx16 y, fx16 w, fx16 h, int col, 
         // onto the slow closed form -- same pixels, six divides each, and no
         // dither. Masking also lets two draws differing only in that bit share
         // one cache entry, which is right, because they render the same.
-        lut = rb_lut_get(rl_blend_cache(blend_cache), blend & ~BLEND_REPLACE, c,
+        lut = RB_LUT_GET(rl_blend_cache(blend_cache), surf, blend & ~BLEND_REPLACE, c,
                          rb_alpha8(alpha));
         if (lut) {
             for (int yy = y0; yy < y1; yy++) {
                 unsigned char *row = surf->pixels + (size_t)yy * surf->stride;
                 for (int xx = x0; xx < x1; xx++)
-                    row[xx] = lut->t[RB_LUT_PHASE(xx, yy)][row[xx] & 0x3F];
+                    row[xx] = RB_LUT_AT(lut, xx, yy, row[xx]);
             }
             return;
         }

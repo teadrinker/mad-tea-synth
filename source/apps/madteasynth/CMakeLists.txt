@@ -65,13 +65,6 @@ set(FONT_HEADERS
   ${CMAKE_CURRENT_SOURCE_DIR}/../../font/font_idealist_hacker_mono_lowspec.h
 )
 
-# RS_PEBBLE_TIME2 for render_lowspec.c only: the vscreen is GColor8, while
-# glyph_render.c's UI tiles must stay 8-bit gray.
-set_source_files_properties(
-  ${CMAKE_CURRENT_SOURCE_DIR}/../../font/render_lowspec.c
-  PROPERTIES COMPILE_DEFINITIONS "RS_PEBBLE_TIME2=1"
-)
-
 set(COMMON_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/../../common/string_pure.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../../common/string_view.c

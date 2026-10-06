@@ -36,10 +36,9 @@ set "OUT_WAV=%PROJECT_NAME%.wav"
 :: though a .wav render never draws anything.
 set "SRC=src/c/render_song.c src/c/vscreen.c src/c/common/math_fixedp.c src/c/common/math_pure.c src/c/font/render_lowspec.c src/c/font/render_ctx.c"
 
-:: RS_PEBBLE_TIME2=1 makes render_lowspec's aaline blend in GColor8 space, the
-:: pixel format vscreen uses. Irrelevant to the audio, kept identical to the
-:: win32 target so the two builds compile the shared sources the same way.
-set "DEFS=-DRS_PEBBLE_TIME2=1"
+:: No RS_PEBBLE_TIME2, as in the win32 target, so the two builds compile the
+:: shared sources the same way. Irrelevant to the audio.
+set "DEFS="
 
 rem -include song_config.h on EVERY translation unit, not just the ones that
 rem name it: vscreen.c only includes vscreen.h, so without this it would compile

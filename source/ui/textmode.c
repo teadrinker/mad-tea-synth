@@ -189,6 +189,7 @@ static void tm_render_lines(const TextMode *tm, Indexed8Bit *dst) {
     surf.clip_y = 0;
     surf.clip_w = dst->w;
     surf.clip_h = dst->h;
+    surf.layout = 0;
 
     for (int i = 1; i < tm->num_line_points; i++) {
         TMLinePoint *p1 = &tm->line_points[i];

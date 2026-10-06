@@ -3,7 +3,8 @@
 //
 // CurlyWas (https://github.com/exoticorn/curlywas) is a curly-braced,
 // infix syntax for WebAssembly.  This emitter translates the VM's typed
-// IR into CurlyWas source that can be compiled with the `curlywas` tool.
+// IR into CurlyWas source that can be compiled with the `curlywas` tool
+// (microw8's `uw8 compile`).
 //
 // Pipeline:  IRNode tree  -->  vm_emit_curlywas()  -->  char* (CurlyWas source)
 //
@@ -13,27 +14,21 @@
 //     freed explicitly.
 //   - The returned string is malloc'd; the caller frees it with sys->free.
 //   - VM array types are not directly representable in CurlyWas (which uses
-//     linear memory).  Array operations are emitted as comments with a
-//     placeholder.
-//   - Template specialisations that share a name get type-mangled CWA names
-//     (e.g. "sq" specialised for i32 and f64 becomes "sq_i32" / "sq_f64").
+//     linear memory).  Whatever the emitter has no spelling for comes out as
+//     a placeholder comment, so a program using it never compiles by accident.
+//   - Nothing is exported: the caller decides which functions are entry points.
 
 #include "vm_emit_curlywas.h"
 #include "vm_emit_shared.h"
 #include "parser/tokens.h"
 #include "common/string_pure.h"
 
-#include <stdint.h>
-
 // ============================================================================
 // Small helpers (no libc)
 // ============================================================================
 
-static int cw_strlen(const char *s) { int n = 0; while (s[n]) n++; return n; }
-
-static int cw_streq(const char *a, const char *b) {
-    while (*a && *b && *a == *b) { a++; b++; }
-    return *a == *b;
+static int cw_is_array(VTKind k) {
+    return k == VMT_ARR_I32 || k == VMT_ARR_F32 || k == VMT_ARR_F64 || k == VMT_ARR_I64;
 }
 
 static const char *cw_wasm_type(VTKind k) {
@@ -42,31 +37,20 @@ static const char *cw_wasm_type(VTKind k) {
         case VMT_I64: return "i64";
         case VMT_F32: return "f32";
         case VMT_F64: return "f64";
-        default:     return "i32";  // fallback
+        default:      return "/*?type?*/";
     }
 }
 
-static int cw_is_scalar(VTKind k) {
-    return k == VMT_I32 || k == VMT_F32 || k == VMT_F64 || k == VMT_I64;
-}
+static const char *const CW_RESERVED_VAR[] = {
+    "fn", "let", "loop", "block", "branch", "branch_if", "if", "else", "return",
+    "select", "as", "global", "lazy", "mut", 0
+};
 
-static int cw_is_array(VTKind k) {
-    return k == VMT_ARR_I32 || k == VMT_ARR_F32 || k == VMT_ARR_F64 || k == VMT_ARR_I64;
-}
-
-static const char *cw_type_tag(VTKind k) {
-    switch (k) {
-        case VMT_I32: return "i32";
-        case VMT_I64: return "i64";
-        case VMT_F32: return "f32";
-        case VMT_F64: return "f64";
-        case VMT_ARR_I32: return "arr_i32";
-        case VMT_ARR_I64: return "arr_i64";
-        case VMT_ARR_F32: return "arr_f32";
-        case VMT_ARR_F64: return "arr_f64";
-        default:     return "v";
-    }
-}
+static const char *const CW_RESERVED_FN[] = {
+    "fn", "let", "loop", "block", "branch", "branch_if", "if", "else", "return",
+    "select", "as", "global", "lazy", "mut",
+    "sqrt", "abs", "min", "max", "floor", "ceil", "trunc", "nearest", 0
+};
 
 // Return the binary-operator CurlyWas token string for a sub_op code.
 static const char *cw_binop_str(int op) {
@@ -84,8 +68,6 @@ static const char *cw_binop_str(int op) {
         case OP_GE:   return " >= ";
         case OP_EQ:   return " == ";
         case OP_NE:   return " != ";
-        case OP_AND:  return " && ";
-        case OP_OR:   return " || ";
         case OP_BAND: return " & ";
         case OP_BOR:  return " | ";
         case OP_BXOR: return " ^ ";
@@ -106,68 +88,120 @@ typedef StrBuf CWBuf;
 #define cw_buf_char  sb_char
 #define cw_buf_int   sb_int
 
-// Emit a floating-point literal.
-// CurlyWas uses the same decimal notation as C: "1.0", "1.5", "1e10".
-// No suffix needed; the type context determines i32/f32/f64 at the use site.
-static void cw_buf_float_lit(CWBuf *b, double v) {
-    char tmp[S_FROM_NUMBER_MAX_CHARS];
-    // SHORTEST: the emitted literal must be the value the VM ran, not %g's
-    // 6 significant digits (which turns 110566002.1 into 110566000).
-    s_from_number_flags(v, tmp, S_FROM_NUMBER_FLAG_SHORTEST);
-    sb_str(b, tmp);
-    int has_dot = 0, has_exp = 0;
-    for (int i = 0; tmp[i]; i++) {
-        if (tmp[i] == '.') has_dot = 1;
-        if (tmp[i] == 'e' || tmp[i] == 'E') has_exp = 1;
-    }
-    if (!has_dot && !has_exp) sb_str(b, ".0");
+static void cw_buf_int_lit(CWBuf *b, long long v, VTKind k) {
+    if (v < 0) cw_buf_char(b, '(');
+    cw_buf_int(b, v);
+    if (k == VMT_I64) cw_buf_str(b, "i64");
+    if (v < 0) cw_buf_char(b, ')');
 }
 
+// CurlyWas float literals are f32 only and have no exponent form.
+static int cw_plain_float_text(const char *s) {
+    for (int i = 0; s[i]; i++)
+        if (s[i] == 'e' || s[i] == 'E') return 0;
+    return 1;
+}
 
+static void cw_buf_plain_f32(CWBuf *b, const char *s) {
+    int has_dot = 0;
+    for (int i = 0; s[i]; i++) if (s[i] == '.') has_dot = 1;
+    cw_buf_char(b, '(');
+    cw_buf_str(b, s);
+    if (!has_dot) cw_buf_str(b, ".0");
+    cw_buf_char(b, ')');
+}
 
-// Build a CurlyWas identifier name for each collected Func.
-static void cw_build_names(VM *vm, Func **list, int count, const char **names_out) {
-    for (int i = 0; i < count; i++) {
-        Func *f = list[i];
-        const char *base = (f->name != 0)
-            ? intern_get_cstr(vm->intern, f->name)
-            : "__script__";
-
-        // Check whether any other function shares this base name.
-        int conflict = 0;
-        for (int j = 0; j < count && !conflict; j++) {
-            if (i == j) continue;
-            Func *g = list[j];
-            const char *gbase = (g->name != 0)
-                ? intern_get_cstr(vm->intern, g->name)
-                : "__script__";
-            if (cw_streq(base, gbase)) conflict = 1;
+// An f32 literal is its decimal when it has one, and its bit pattern otherwise.
+// An f64 is an f32 literal widened when that is exact, and its bit pattern
+// otherwise: CurlyWas has no f64 literal.
+static void cw_buf_float_lit(CWBuf *b, double v, VTKind k) {
+    char tmp[S_FROM_NUMBER_MAX_CHARS];
+    int finite = (v == v) && (v - v == 0.0);
+    if (k == VMT_F32) {
+        union { float f; int i; } u;
+        u.f = (float)v;
+        if (finite && u.i != (int)0x80000000) {
+            s_from_number_flags((double)u.f, tmp, S_FROM_NUMBER_FLAG_SHORTEST);
+            if (cw_plain_float_text(tmp)) { cw_buf_plain_f32(b, tmp); return; }
         }
-
-        if (!conflict) {
-            names_out[i] = base;
-        } else {
-            // Mangle: "name_T0_T1_..."
-            int blen = cw_strlen(base);
-            int total = blen + f->n_params * 4 + 1;
-            char *out = (char *)mem_alloc(&vm->run.mem, (size_t)total);
-            int p = 0;
-            for (int k = 0; k < blen; k++) out[p++] = base[k];
-            for (int k = 0; k < f->n_params; k++) {
-                VTKind pk = f->syms[f->param_slot[k]].type.kind;
-                const char *tag = cw_type_tag(pk);
-                out[p++] = '_';
-                for (int t = 0; tag[t]; t++) out[p++] = tag[t];
-            }
-            out[p] = '\0';
-            names_out[i] = out;
+        cw_buf_str(b, "f32.reinterpret_i32(");
+        cw_buf_int_lit(b, (long long)u.i, VMT_I32);
+        cw_buf_char(b, ')');
+        return;
+    }
+    union { double d; long long i; } u;
+    u.d = v;
+    if (u.i == 0) { cw_buf_str(b, "(0.0 as f64)"); return; }
+    if (finite && (double)(float)v == v) {
+        s_from_number_flags(v, tmp, S_FROM_NUMBER_FLAG_SHORTEST);
+        if (cw_plain_float_text(tmp)) {
+            cw_buf_char(b, '(');
+            cw_buf_plain_f32(b, tmp);
+            cw_buf_str(b, " as f64)");
+            return;
         }
+    }
+    cw_buf_str(b, "f64.reinterpret_i64(");
+    cw_buf_int_lit(b, u.i, VMT_I64);
+    cw_buf_char(b, ')');
+}
+
+// ============================================================================
+// Guarded division, as the interpreter's eval_binop takes OP_DIV / OP_MOD: a zero
+// divisor gives 0, and -1 negates rather than trapping on INT_MIN / -1.
+// ============================================================================
+
+enum { DH_DIV_I32, DH_MOD_I32, DH_DIV_I64, DH_MOD_I64, DH_DIV_F32, DH_DIV_F64, DH_COUNT };
+
+static const char *CW_DIV_FN[DH_COUNT] = {
+    "vm_div_i32", "vm_mod_i32", "vm_div_i64", "vm_mod_i64", "vm_div_f32", "vm_div_f64",
+};
+
+static const char *CW_DIV_DEF[DH_COUNT] = {
+"fn vm_div_i32(a: i32, b: i32) -> i32 {\n  if (b == 0) { 0 } else { if (b == -1) { 0 - a } else { a / b } }\n}\n",
+"fn vm_mod_i32(a: i32, b: i32) -> i32 {\n  if (b == 0) { 0 } else { if (b == -1) { 0 } else { a % b } }\n}\n",
+"fn vm_div_i64(a: i64, b: i64) -> i64 {\n  if (b == 0i64) { 0i64 } else { if (b == -1i64) { 0i64 - a } else { a / b } }\n}\n",
+"fn vm_mod_i64(a: i64, b: i64) -> i64 {\n  if (b == 0i64) { 0i64 } else { if (b == -1i64) { 0i64 } else { a % b } }\n}\n",
+"fn vm_div_f32(a: f32, b: f32) -> f32 {\n  if (b == 0.0) { 0.0 } else { a / b }\n}\n",
+"fn vm_div_f64(a: f64, b: f64) -> f64 {\n  if (b == (0.0 as f64)) { (0.0 as f64) } else { a / b }\n}\n",
+};
+
+// The CW_DIV_FN a node calls, or -1 when it emits inline: not a guarded op, or
+// a literal divisor that is neither zero nor -1.
+static int cw_div_helper(Func *f, IRNode *n) {
+    if (n->op != IR_BINOP || (n->sub_op != OP_DIV && n->sub_op != OP_MOD)) return -1;
+    IRNode *d = ir_child(f, n->b);
+    if (d && d->op == IR_CONST_I && d->ki != 0 && d->ki != -1) return -1;
+    if (d && d->op == IR_CONST_F && d->kf != 0.0) return -1;
+    int mod = (n->sub_op == OP_MOD);
+    switch (n->type.kind) {
+        case VMT_I32: return mod ? DH_MOD_I32 : DH_DIV_I32;
+        case VMT_I64: return mod ? DH_MOD_I64 : DH_DIV_I64;
+        case VMT_F32: return mod ? -1 : DH_DIV_F32;
+        case VMT_F64: return mod ? -1 : DH_DIV_F64;
+        default:      return -1;
+    }
+}
+
+static void cw_emit_div_helpers(CWBuf *b, Func **list, int count) {
+    unsigned used = 0;
+    for (int fi = 0; fi < count; fi++)
+        for (int ni = 0; ni < list[fi]->n_nodes; ni++) {
+            int h = cw_div_helper(list[fi], &list[fi]->nodes[ni]);
+            if (h >= 0) used |= 1u << h;
+        }
+    for (int i = 0; i < DH_COUNT; i++) {
+        if (!(used & (1u << i))) continue;
+        cw_buf_str(b, CW_DIV_DEF[i]);
+        cw_buf_char(b, '\n');
     }
 }
 
 // ============================================================================
 // Emitter state
 // ============================================================================
+
+#define CW_MAX_LOOPS 64
 
 typedef struct {
     CWBuf       out;
@@ -177,6 +211,11 @@ typedef struct {
     Func      **func_list;      // collected function pointers
     const char **func_cnames;   // CWA names parallel to func_list
     int         func_count;
+    const char **local_names;   // indexed by slot, for cur_func
+    int         n_local_names;
+    int         loop_n;         // loops numbered so far in cur_func
+    int         depth;          // loops open around the node being emitted
+    int         loop_id[CW_MAX_LOOPS];
 } CWEmitt;
 
 static void cw_emit_indent(CWEmitt *e) {
@@ -197,15 +236,36 @@ static int cw_is_param(Func *f, int idx) {
     return 0;
 }
 
-// Emit the name of a local variable (slot index into cur_func->syms).
-static void cw_emit_local_name(CWEmitt *e, int slot) {
-    VMSym *s = &e->cur_func->syms[slot];
-    if (s->name != 0) {
-        cw_buf_str(&e->out, intern_get_cstr(e->vm->intern, s->name));
-    } else {
-        cw_buf_str(&e->out, "__v");
-        cw_buf_int(&e->out, (long long)slot);
+// One name per slot, escaped against CurlyWas's keywords and against the slots
+// named before it, so two slots spelled alike never share a variable.
+static void cw_build_local_names(CWEmitt *e, Func *f) {
+    VM *vm = e->vm;
+    const char **names = (const char **)mem_alloc(&vm->run.mem, sizeof(char *) * (size_t)(f->n_syms + 1));
+    e->local_names = names;
+    e->n_local_names = names ? f->n_syms : 0;
+    if (!names) return;
+    for (int i = 0; i < f->n_syms; i++) {
+        VMSym *s = &f->syms[i];
+        if (s->name != 0) {
+            names[i] = es_escape_name(vm, intern_get_cstr(vm->intern, s->name), CW_RESERVED_VAR, names, i);
+            continue;
+        }
+        char *out = (char *)mem_alloc(&vm->run.mem, 16);
+        if (!out) { names[i] = "__v"; continue; }
+        int p = 0, v = i, dn = 0;
+        char dg[8];
+        out[p++] = '_'; out[p++] = '_'; out[p++] = 'v';
+        if (v == 0) dg[dn++] = '0';
+        while (v > 0) { dg[dn++] = (char)('0' + v % 10); v /= 10; }
+        while (dn > 0) out[p++] = dg[--dn];
+        out[p] = '\0';
+        names[i] = out;
     }
+}
+
+static void cw_emit_local_name(CWEmitt *e, int slot) {
+    if (slot < 0 || slot >= e->n_local_names) { cw_buf_str(&e->out, "__bad"); return; }
+    cw_buf_str(&e->out, e->local_names[slot]);
 }
 
 // ============================================================================
@@ -214,6 +274,60 @@ static void cw_emit_local_name(CWEmitt *e, int slot) {
 
 // Forward declaration.
 static void cw_emit_expr(CWEmitt *e, IRNode *n);
+
+// ============================================================================
+// Host buffers placed in linear memory (vm_place_host_buffer)
+// ============================================================================
+
+// The load/store operator for one element, and its size: u8 `?`, i32 `!`, f32 `$`.
+static char cw_buf_access(VMType t, int *size) {
+    *size = 4;
+    if (t.kind == VMT_SLICE_I32 && t.pack_bits == 8) { *size = 1; return '?'; }
+    if (t.kind == VMT_SLICE_I32 && t.pack_bits == 0) return '!';
+    if (t.kind == VMT_SLICE_F32 && t.pack_bits == 0) return '$';
+    return 0;
+}
+
+// The host-buffer id `base` reads, when that buffer has a place in memory and an
+// element CurlyWas can load; -1 otherwise.
+static int cw_placed_buf(CWEmitt *e, IRNode *base) {
+    if (!base || base->op != IR_LOCAL) return -1;
+    VMSym *s = &e->cur_func->syms[(int)base->ki];
+    if (!s->is_host_buf) return -1;
+    int id = s->offset / (int)sizeof(VMHostBufSlot), size;
+    if (id < 0 || id >= VM_MAX_HOST_BUFS) return -1;
+    if (!e->vm->host_bufs[id].declared || !e->vm->host_bufs[id].mem_placed) return -1;
+    return cw_buf_access(s->type, &size) ? id : -1;
+}
+
+// `(i)?addr` / `(i * 4)!addr`: the index is the base, the buffer's address the offset.
+static void cw_emit_buf_elem(CWEmitt *e, int id, IRNode *idx) {
+    int size;
+    char op = cw_buf_access(e->vm->host_bufs[id].type, &size);
+    cw_buf_char(&e->out, '(');
+    cw_emit_expr(e, idx);
+    if (size != 1) { cw_buf_str(&e->out, " * "); cw_buf_int(&e->out, size); }
+    cw_buf_char(&e->out, ')');
+    cw_buf_char(&e->out, op);
+    unsigned addr = (unsigned)e->vm->host_bufs[id].mem_addr;
+    char hex[12];
+    int n = 0;
+    do { hex[n++] = "0123456789abcdef"[addr & 15]; addr >>= 4; } while (addr);
+    cw_buf_str(&e->out, "0x");
+    while (n > 0) cw_buf_char(&e->out, hex[--n]);
+}
+
+// Emit `n` as an i32 truth value: an i32 as it stands, anything else != 0.
+static void cw_emit_cond(CWEmitt *e, IRNode *n) {
+    VTKind k = n->type.kind;
+    if (k != VMT_I64 && k != VMT_F32 && k != VMT_F64) { cw_emit_expr(e, n); return; }
+    cw_buf_char(&e->out, '(');
+    cw_emit_expr(e, n);
+    cw_buf_str(&e->out, " != ");
+    if (k == VMT_I64) cw_buf_str(&e->out, "0i64");
+    else              cw_buf_float_lit(&e->out, 0.0, k);
+    cw_buf_char(&e->out, ')');
+}
 
 // Emit a call to a native (registered C) function.
 // CurlyWas doesn't have native C functions; we emit the name and args.
@@ -243,6 +357,50 @@ static void cw_emit_native_call(CWEmitt *e, Func *callee, IRNode *n) {
 // Forward declaration for statement emitter.
 static void cw_emit_stmt(CWEmitt *e, IRNode *n);
 
+static void cw_emit_binop(CWEmitt *e, IRNode *n) {
+    Func *f = e->cur_func;
+    IRNode *a = ir_child(f, n->a);
+    IRNode *b = ir_child(f, n->b);
+
+    if (n->sub_op == OP_AND || n->sub_op == OP_OR) {
+        int is_and = (n->sub_op == OP_AND);
+        cw_buf_str(&e->out, "(if (");
+        cw_emit_cond(e, a);
+        cw_buf_str(&e->out, is_and ? ") { (" : ") { 1 } else { (");
+        if (is_and) {
+            cw_emit_cond(e, b);
+            cw_buf_str(&e->out, " != 0) } else { 0 })");
+        } else {
+            cw_emit_cond(e, b);
+            cw_buf_str(&e->out, " != 0) })");
+        }
+        return;
+    }
+
+    int dh = cw_div_helper(f, n);
+    if (dh >= 0) {
+        cw_buf_str(&e->out, CW_DIV_FN[dh]);
+        cw_buf_char(&e->out, '(');
+        cw_emit_expr(e, a);
+        cw_buf_str(&e->out, ", ");
+        cw_emit_expr(e, b);
+        cw_buf_char(&e->out, ')');
+        return;
+    }
+
+    cw_buf_char(&e->out, '(');
+    cw_emit_expr(e, a);
+    cw_buf_str(&e->out, cw_binop_str(n->sub_op));
+    // A 64-bit shift takes a 64-bit count in wasm; the VM's count is any integer.
+    int wide_shift = n->type.kind == VMT_I64
+                  && (n->sub_op == OP_BSHL || n->sub_op == OP_BSHL_NATIVE || n->sub_op == OP_BSHR)
+                  && b->type.kind == VMT_I32;
+    if (wide_shift) cw_buf_char(&e->out, '(');
+    cw_emit_expr(e, b);
+    if (wide_shift) cw_buf_str(&e->out, " as i64)");
+    cw_buf_char(&e->out, ')');
+}
+
 static void cw_emit_expr(CWEmitt *e, IRNode *n) {
     if (!n) { cw_buf_str(&e->out, "/*null*/"); return; }
 
@@ -250,11 +408,11 @@ static void cw_emit_expr(CWEmitt *e, IRNode *n) {
 
         // ---- constants -------------------------------------------------------
         case IR_CONST_I:
-            cw_buf_int(&e->out, n->ki);
+            cw_buf_int_lit(&e->out, n->ki, n->type.kind);
             break;
 
         case IR_CONST_F:
-            cw_buf_float_lit(&e->out, n->kf);
+            cw_buf_float_lit(&e->out, n->kf, n->type.kind);
             break;
 
         // ---- locals / indexing -----------------------------------------------
@@ -267,6 +425,13 @@ static void cw_emit_expr(CWEmitt *e, IRNode *n) {
             // CurlyWas uses linear memory for arrays, not typed arrays.
             // Emit as a memory access comment for now.
             IRNode *base = ir_child(e->cur_func, n->a);
+            int hb = cw_placed_buf(e, base);
+            if (hb >= 0) {
+                cw_buf_char(&e->out, '(');
+                cw_emit_buf_elem(e, hb, ir_child(e->cur_func, n->b));
+                cw_buf_char(&e->out, ')');
+                break;
+            }
             cw_buf_str(&e->out, "/* array: ");
             if (base->op == IR_LOCAL) {
                 cw_emit_local_name(e, (int)base->ki);
@@ -281,6 +446,13 @@ static void cw_emit_expr(CWEmitt *e, IRNode *n) {
             break;
         }
 
+        case IR_LEN: {
+            int hb = cw_placed_buf(e, ir_child(e->cur_func, n->a));
+            if (hb >= 0 && n->ki <= 0) cw_buf_int(&e->out, e->vm->host_bufs[hb].mem_len);
+            else                       cw_buf_str(&e->out, "/*?len?*/");
+            break;
+        }
+
         // Struct records are arrays underneath, and arrays
         // are not implemented here, so a field gets the same placeholder an element
         // does.
@@ -289,13 +461,27 @@ static void cw_emit_expr(CWEmitt *e, IRNode *n) {
             break;
 
         // ---- conversion ------------------------------------------------------
-        case IR_CVT:
+        // A float to an integer saturates, nan giving 0, as the VM does it, unless
+        // the body asked for the host's own cast.
+        case IR_CVT: {
+            IRNode *a = ir_child(e->cur_func, n->a);
+            VTKind from = a->type.kind, to = n->type.kind;
+            if (from == to) { cw_emit_expr(e, a); break; }
+            int f2i = (from == VMT_F32 || from == VMT_F64) && (to == VMT_I32 || to == VMT_I64);
+            if (f2i && !(emit_func_flags(e->vm, e->cur_func) & VM_FLAG_C_FLOAT_TO_INT)) {
+                cw_buf_str(&e->out, to == VMT_I64 ? "i64.trunc_sat_" : "i32.trunc_sat_");
+                cw_buf_str(&e->out, from == VMT_F64 ? "f64_s(" : "f32_s(");
+                cw_emit_expr(e, a);
+                cw_buf_char(&e->out, ')');
+                break;
+            }
             cw_buf_char(&e->out, '(');
-            cw_emit_expr(e, ir_child(e->cur_func, n->a));
+            cw_emit_expr(e, a);
             cw_buf_str(&e->out, " as ");
-            cw_buf_str(&e->out, cw_wasm_type(n->type.kind));
+            cw_buf_str(&e->out, cw_wasm_type(to));
             cw_buf_char(&e->out, ')');
             break;
+        }
 
 #if VM_HAS_INSPECT
         // Editor-only: renders as its operand alone (see vm_emit_c.c).
@@ -305,21 +491,27 @@ static void cw_emit_expr(CWEmitt *e, IRNode *n) {
 #endif
 
         // ---- bit-preserving reinterpretation ---------------------------------
-        case IR_BITCAST:
+        case IR_BITCAST: {
+            VTKind from = (VTKind)n->sub_op, to = n->type.kind;
             // Same kind means i32 <-> fxN: the shift only ever existed at
             // compile time, so the operand is already the result.
-            if (n->sub_op == (int)n->type.kind) {
+            if (from == to) {
                 cw_buf_char(&e->out, '(');
                 cw_emit_expr(e, ir_child(e->cur_func, n->a));
                 cw_buf_char(&e->out, ')');
                 break;
             }
-            // The i32<->f32 / i64<->f64 pairs are wasm's *.reinterpret_*
-            // instructions, which this emitter has no CurlyWas spelling for.
-            // Emit a marker that will not compile rather than ` as `, which
-            // would silently convert the value instead of its bits.
-            cw_buf_str(&e->out, "/*?bitcast unsupported?*/");
+            int ok = (from == VMT_I32 && to == VMT_F32) || (from == VMT_F32 && to == VMT_I32)
+                  || (from == VMT_I64 && to == VMT_F64) || (from == VMT_F64 && to == VMT_I64);
+            if (!ok) { cw_buf_str(&e->out, "/*?bitcast unsupported?*/"); break; }
+            cw_buf_str(&e->out, cw_wasm_type(to));
+            cw_buf_str(&e->out, ".reinterpret_");
+            cw_buf_str(&e->out, cw_wasm_type(from));
+            cw_buf_char(&e->out, '(');
+            cw_emit_expr(e, ir_child(e->cur_func, n->a));
+            cw_buf_char(&e->out, ')');
             break;
+        }
 
         // ---- unary ops -------------------------------------------------------
         case IR_UNOP:
@@ -329,28 +521,25 @@ static void cw_emit_expr(CWEmitt *e, IRNode *n) {
                 cw_buf_str(&e->out, "))");
             } else { // OP_NOT
                 cw_buf_str(&e->out, "(!(");
-                cw_emit_expr(e, ir_child(e->cur_func, n->a));
+                cw_emit_cond(e, ir_child(e->cur_func, n->a));
                 cw_buf_str(&e->out, "))");
             }
             break;
 
         // ---- binary ops ------------------------------------------------------
         case IR_BINOP:
-            cw_buf_char(&e->out, '(');
-            cw_emit_expr(e, ir_child(e->cur_func, n->a));
-            cw_buf_str(&e->out, cw_binop_str(n->sub_op));
-            cw_emit_expr(e, ir_child(e->cur_func, n->b));
-            cw_buf_char(&e->out, ')');
+            cw_emit_binop(e, n);
             break;
 
+        // Lazy, as ?: is in the VM: wasm's select would run both arms.
         case IR_SELECT:
-            cw_buf_str(&e->out, "select(");
-            cw_emit_expr(e, ir_child(e->cur_func, n->a));
-            cw_buf_str(&e->out, ", ");
+            cw_buf_str(&e->out, "(if (");
+            cw_emit_cond(e, ir_child(e->cur_func, n->a));
+            cw_buf_str(&e->out, ") { ");
             cw_emit_expr(e, ir_child(e->cur_func, n->b));
-            cw_buf_str(&e->out, ", ");
+            cw_buf_str(&e->out, " } else { ");
             cw_emit_expr(e, ir_child(e->cur_func, n->c));
-            cw_buf_char(&e->out, ')');
+            cw_buf_str(&e->out, " })");
             break;
 
         // ---- comma / sequence expression -------------------------------------
@@ -360,10 +549,16 @@ static void cw_emit_expr(CWEmitt *e, IRNode *n) {
             cw_buf_str(&e->out, "{ ");
             for (int i = 0; i < n->n_items; i++) {
                 IRNode *it = ir_item(e->cur_func, n, i);
+                int last = (i == n->n_items - 1);
                 if (it->op == IR_ASSIGN) {
                     IRNode *lv = ir_child(e->cur_func, it->a);
+                    int hb = lv->op == IR_INDEX ? cw_placed_buf(e, ir_child(e->cur_func, lv->a)) : -1;
                     if (lv->op == IR_LOCAL) {
                         cw_emit_local_name(e, (int)lv->ki);
+                        cw_buf_str(&e->out, " = ");
+                        cw_emit_expr(e, ir_child(e->cur_func, it->b));
+                    } else if (hb >= 0) {
+                        cw_emit_buf_elem(e, hb, ir_child(e->cur_func, lv->b));
                         cw_buf_str(&e->out, " = ");
                         cw_emit_expr(e, ir_child(e->cur_func, it->b));
                     } else {
@@ -376,6 +571,7 @@ static void cw_emit_expr(CWEmitt *e, IRNode *n) {
                     cw_buf_str(&e->out, "; ");
                 } else {
                     cw_emit_expr(e, it);
+                    if (!last) cw_buf_str(&e->out, "; ");
                 }
             }
             cw_buf_str(&e->out, " }");
@@ -413,11 +609,51 @@ static void cw_emit_expr(CWEmitt *e, IRNode *n) {
 static void cw_emit_stmt_last(CWEmitt *e, IRNode *n, int is_last);
 
 // Emit an item as the last element in a block (is_last=1 means no semicolon
-// needed if it's a return-with-value — it becomes the block's implicit return).
+// needed if it's a return-with-value -- it becomes the block's implicit return).
 // In CurlyWas the last expression in a block is the return value and has no
 // semicolon; early returns use the `return` keyword explicitly.
 static void cw_emit_stmt(CWEmitt *e, IRNode *n) {
     cw_emit_stmt_last(e, n, 0);
+}
+
+static void cw_emit_block_items(CWEmitt *e, IRNode *blk, int is_last) {
+    if (!blk) return;
+    for (int i = 0; i < blk->n_items; i++)
+        cw_emit_stmt_last(e, ir_item(e->cur_func, blk, i), (i == blk->n_items - 1) ? is_last : 0);
+}
+
+// block brk_N { loop top_N { branch_if !cond: brk_N; block cont_N { body } step; branch top_N; } }
+// `continue` leaves cont_N, so the step still runs; `break` leaves brk_N.
+static void cw_emit_loop(CWEmitt *e, IRNode *n) {
+    if (e->depth >= CW_MAX_LOOPS) {
+        cw_emit_indent(e); cw_buf_str(&e->out, "/* loops nested too deep */\n");
+        return;
+    }
+    int id = ++e->loop_n;
+    e->loop_id[e->depth++] = id;
+
+    cw_emit_indent(e); cw_buf_str(&e->out, "block brk_"); cw_buf_int(&e->out, id); cw_buf_str(&e->out, " {\n");
+    e->indent++;
+    cw_emit_indent(e); cw_buf_str(&e->out, "loop top_"); cw_buf_int(&e->out, id); cw_buf_str(&e->out, " {\n");
+    e->indent++;
+    if (n->a >= 0) {
+        cw_emit_indent(e); cw_buf_str(&e->out, "branch_if (!(");
+        cw_emit_cond(e, ir_child(e->cur_func, n->a));
+        cw_buf_str(&e->out, ")): brk_"); cw_buf_int(&e->out, id); cw_buf_str(&e->out, ";\n");
+    }
+    cw_emit_indent(e); cw_buf_str(&e->out, "block cont_"); cw_buf_int(&e->out, id); cw_buf_str(&e->out, " {\n");
+    e->indent++;
+    cw_emit_block_items(e, ir_child(e->cur_func, n->b), 0);
+    e->indent--;
+    cw_emit_indent(e); cw_buf_str(&e->out, "}\n");
+    if (n->op == IR_FOR && n->c >= 0) cw_emit_block_items(e, ir_child(e->cur_func, n->c), 0);
+    cw_emit_indent(e); cw_buf_str(&e->out, "branch top_"); cw_buf_int(&e->out, id); cw_buf_str(&e->out, ";\n");
+    e->indent--;
+    cw_emit_indent(e); cw_buf_str(&e->out, "}\n");
+    e->indent--;
+    cw_emit_indent(e); cw_buf_str(&e->out, "}\n");
+
+    e->depth--;
 }
 
 static void cw_emit_stmt_last(CWEmitt *e, IRNode *n, int is_last) {
@@ -429,104 +665,51 @@ static void cw_emit_stmt_last(CWEmitt *e, IRNode *n, int is_last) {
         case IR_BLOCK:
             cw_emit_indent(e); cw_buf_str(&e->out, "{\n");
             e->indent++;
-            for (int i = 0; i < n->n_items; i++)
-                cw_emit_stmt_last(e, ir_item(e->cur_func, n, i), (i == n->n_items - 1) ? is_last : 0);
+            cw_emit_block_items(e, n, is_last);
             e->indent--;
             cw_emit_indent(e); cw_buf_str(&e->out, "}\n");
             break;
 
         // ---- if / else -------------------------------------------------------
-        case IR_IF:
+        // Both arms carry the value when this is the function's tail; an if with
+        // no else is a statement and returns early with `return`.
+        case IR_IF: {
+            int has_else = n->c >= 0;
             cw_emit_indent(e); cw_buf_str(&e->out, "if (");
-            cw_emit_expr(e, ir_child(e->cur_func, n->a));
+            cw_emit_cond(e, ir_child(e->cur_func, n->a));
             cw_buf_str(&e->out, ") {\n");
             e->indent++;
-            {
-                IRNode *tb = ir_child(e->cur_func, n->b);
-                // then-block: only propagate is_last when there's no else
-                int then_last = is_last && (n->c < 0);
-                if (tb) {
-                    for (int i = 0; i < tb->n_items; i++)
-                        cw_emit_stmt_last(e, ir_item(e->cur_func, tb, i),
-                            (i == tb->n_items - 1) ? then_last : 0);
-                }
-            }
+            cw_emit_block_items(e, ir_child(e->cur_func, n->b), is_last && has_else);
             e->indent--;
             cw_emit_indent(e); cw_buf_char(&e->out, '}');
-            if (n->c >= 0) {
-                IRNode *eb = ir_child(e->cur_func, n->c);
+            if (has_else) {
                 cw_buf_str(&e->out, " else {\n");
                 e->indent++;
-                if (eb) {
-                    for (int i = 0; i < eb->n_items; i++)
-                        cw_emit_stmt_last(e, ir_item(e->cur_func, eb, i),
-                            (i == eb->n_items - 1) ? is_last : 0);
-                }
+                cw_emit_block_items(e, ir_child(e->cur_func, n->c), is_last);
                 e->indent--;
                 cw_emit_indent(e); cw_buf_char(&e->out, '}');
             }
             cw_buf_char(&e->out, '\n');
             break;
+        }
 
-        // ---- while -> loop + branch_if ---------------------------------------
+        // ---- loops -----------------------------------------------------------
         case IR_WHILE:
-            cw_emit_indent(e); cw_buf_str(&e->out, "loop while_");
-            cw_buf_int(&e->out, (long long)(intptr_t)n);
-            cw_buf_str(&e->out, " {\n");
-            e->indent++;
-            // Condition check at top
-            cw_emit_indent(e); cw_buf_str(&e->out, "branch_if (");
-            cw_emit_expr(e, ir_child(e->cur_func, n->a));
-            cw_buf_str(&e->out, ") == 0: while_");
-            cw_buf_int(&e->out, (long long)(intptr_t)n);
-            cw_buf_str(&e->out, ";\n");
-            // Loop body (is_last not propagated — loop body never contributes
-            // to the outer block's return value)
-            {
-                IRNode *body = ir_child(e->cur_func, n->b);
-                if (body) {
-                    for (int i = 0; i < body->n_items; i++)
-                        cw_emit_stmt(e, ir_item(e->cur_func, body, i));
-                }
-            }
-            e->indent--;
-            cw_emit_indent(e); cw_buf_str(&e->out, "}\n");
-            break;
-
-        // ---- for -> loop + branch_if, step appended to the body --------------
         case IR_FOR:
-            cw_emit_indent(e); cw_buf_str(&e->out, "loop for_");
-            cw_buf_int(&e->out, (long long)(intptr_t)n);
-            cw_buf_str(&e->out, " {\n");
-            e->indent++;
-            cw_emit_indent(e); cw_buf_str(&e->out, "branch_if (");
-            cw_emit_expr(e, ir_child(e->cur_func, n->a));
-            cw_buf_str(&e->out, ") == 0: for_");
-            cw_buf_int(&e->out, (long long)(intptr_t)n);
-            cw_buf_str(&e->out, ";\n");
-            {
-                IRNode *body = ir_child(e->cur_func, n->b);
-                if (body) {
-                    for (int i = 0; i < body->n_items; i++)
-                        cw_emit_stmt(e, ir_item(e->cur_func, body, i));
-                }
-                IRNode *step = ir_child(e->cur_func, n->c);
-                if (step) {
-                    for (int i = 0; i < step->n_items; i++)
-                        cw_emit_stmt(e, ir_item(e->cur_func, step, i));
-                }
-            }
-            e->indent--;
-            cw_emit_indent(e); cw_buf_str(&e->out, "}\n");
+            cw_emit_loop(e, n);
             break;
 
         // ---- loop controls ---------------------------------------------------
         case IR_BREAK:
-            cw_emit_indent(e); cw_buf_str(&e->out, "branch break_label;\n");
-            break;
-
         case IR_CONTINUE:
-            cw_emit_indent(e); cw_buf_str(&e->out, "branch continue_label;\n");
+            cw_emit_indent(e);
+            if (e->depth == 0) {
+                cw_buf_str(&e->out, "/* break or continue outside a loop */\n");
+                break;
+            }
+            cw_buf_str(&e->out, n->op == IR_BREAK ? "branch brk_" : "branch cont_");
+            cw_buf_int(&e->out, e->loop_id[e->depth - 1]);
+            cw_buf_str(&e->out, ";\n");
             break;
 
         // ---- return ----------------------------------------------------------
@@ -539,7 +722,7 @@ static void cw_emit_stmt_last(CWEmitt *e, IRNode *n, int is_last) {
                     cw_emit_expr(e, ir_child(e->cur_func, n->a));
                     cw_buf_str(&e->out, "\n");
                 } else {
-                    // Early return — use explicit `return` keyword
+                    // Early return -- use explicit `return` keyword
                     cw_emit_indent(e); cw_buf_str(&e->out, "return ");
                     cw_emit_expr(e, ir_child(e->cur_func, n->a));
                     cw_buf_str(&e->out, ";\n");
@@ -572,6 +755,12 @@ static void cw_emit_stmt_last(CWEmitt *e, IRNode *n, int is_last) {
                     cw_emit_expr(e, ir_item(e->cur_func, rv, i));
                 }
                 cw_buf_str(&e->out, "} */\n");
+            } else if (lv->op == IR_INDEX && cw_placed_buf(e, ir_child(e->cur_func, lv->a)) >= 0) {
+                cw_emit_indent(e);
+                cw_emit_buf_elem(e, cw_placed_buf(e, ir_child(e->cur_func, lv->a)), ir_child(e->cur_func, lv->b));
+                cw_buf_str(&e->out, " = ");
+                cw_emit_expr(e, rv);
+                cw_buf_str(&e->out, ";\n");
             } else if (lv->op == IR_INDEX) {
                 // Index assignment: comment it out
                 IRNode *ilv_base = ir_child(e->cur_func, lv->a);
@@ -633,29 +822,26 @@ static void cw_emit_func_signature(CWEmitt *e, Func *f, const char *cname) {
     cw_buf_str(&e->out, cname);
     cw_buf_char(&e->out, '(');
 
-    if (f->n_params == 0) {
-        // No params
-    } else {
-        for (int i = 0; i < f->n_params; i++) {
-            if (i) cw_buf_str(&e->out, ", ");
-            VMSym *s = &f->syms[f->param_slot[i]];
-            const char *pname = (s->name != 0)
-                ? intern_get_cstr(e->vm->intern, s->name) : "__p";
-            cw_buf_str(&e->out, pname);
-            cw_buf_str(&e->out, ": ");
-            cw_buf_str(&e->out, cw_wasm_type(s->type.kind));
-        }
+    for (int i = 0; i < f->n_params; i++) {
+        if (i) cw_buf_str(&e->out, ", ");
+        cw_emit_local_name(e, f->param_slot[i]);
+        cw_buf_str(&e->out, ": ");
+        cw_buf_str(&e->out, cw_wasm_type(f->syms[f->param_slot[i]].type.kind));
     }
     cw_buf_char(&e->out, ')');
 }
 
 // Emit a complete function definition.
 static void cw_emit_func(CWEmitt *e, Func *f, const char *cname) {
-    Func *saved   = e->cur_func;
+    Func *saved_func = e->cur_func;
+    const char **saved_names = e->local_names;
+    int saved_n_names = e->n_local_names;
     e->cur_func   = f;
     e->indent     = 0;
+    e->loop_n     = 0;
+    e->depth      = 0;
+    cw_build_local_names(e, f);
 
-    // Return type annotation
     cw_buf_str(&e->out, "fn ");
     cw_emit_func_signature(e, f, cname);
     if (f->ret_type.kind != VMT_VOID) {
@@ -669,6 +855,7 @@ static void cw_emit_func(CWEmitt *e, Func *f, const char *cname) {
     for (int i = 0; i < f->n_syms; i++) {
         VMSym *s = &f->syms[i];
         if (s->is_func)             continue;
+        if (s->is_host_buf)         continue;
         if (cw_is_param(f, i))      continue;
         if (s->type.kind == VMT_VOID) continue;
 
@@ -701,12 +888,19 @@ static void cw_emit_func(CWEmitt *e, Func *f, const char *cname) {
     }
 
     cw_buf_str(&e->out, "}\n");
-    e->cur_func = saved;
+    e->cur_func = saved_func;
+    e->local_names = saved_names;
+    e->n_local_names = saved_n_names;
 }
 
 // ============================================================================
 // Public API
 // ============================================================================
+
+static void cw_emit_prelude(CWEmitt *e, Func **list, int count) {
+    cw_buf_str(&e->out, "import \"env.memory\" memory(4);\n\n");
+    cw_emit_div_helpers(&e->out, list, count);
+}
 
 char *vm_emit_curlywas(VM *vm) {
     // Collect emittable functions.
@@ -715,7 +909,7 @@ char *vm_emit_curlywas(VM *vm) {
 
     int count = emit_collect_funcs(vm, func_list, MAX_EMIT_FUNCS);
     if (count < 0) return 0;
-    cw_build_names(vm, func_list, count, func_cnames);
+    emit_build_cnames(vm, func_list, count, func_cnames, CW_RESERVED_FN);
 
     CWEmitt e;
     e.vm          = vm;
@@ -724,10 +918,13 @@ char *vm_emit_curlywas(VM *vm) {
     e.func_list   = func_list;
     e.func_cnames = func_cnames;
     e.func_count  = count;
+    e.local_names = 0;
+    e.n_local_names = 0;
+    e.loop_n      = 0;
+    e.depth       = 0;
     cw_buf_init(&e.out, vm);
 
-    // Emit a memory import (required for any wasm module)
-    cw_buf_str(&e.out, "import \"env.env\" memory(1);\n\n");
+    cw_emit_prelude(&e, func_list, count);
 
     if (count == 0) {
         cw_buf_str(&e.out, "// No user-defined functions to emit.\n");
@@ -751,9 +948,8 @@ char *func_emit_curlywas(Func *f) {
     Func       *func_list [1];
     const char *func_cnames[1];
     func_list[0] = f;
-    func_cnames[0] = (f->name != 0)
-        ? intern_get_cstr(vm->intern, f->name)
-        : "__script__";
+    func_cnames[0] = es_escape_name(vm, (f->name != 0) ? intern_get_cstr(vm->intern, f->name) : "__script__",
+                                    CW_RESERVED_FN, 0, 0);
 
     CWEmitt e;
     e.vm          = vm;
@@ -762,9 +958,13 @@ char *func_emit_curlywas(Func *f) {
     e.func_list   = func_list;
     e.func_cnames = func_cnames;
     e.func_count  = 1;
+    e.local_names = 0;
+    e.n_local_names = 0;
+    e.loop_n      = 0;
+    e.depth       = 0;
     cw_buf_init(&e.out, vm);
 
-    cw_buf_str(&e.out, "import \"env.env\" memory(1);\n\n");
+    cw_emit_prelude(&e, func_list, 1);
     cw_emit_func(&e, f, func_cnames[0]);
 
     if (!e.out.ok) { vm->run.sys->free(e.out.buf); return 0; }

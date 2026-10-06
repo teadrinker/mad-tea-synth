@@ -6,6 +6,12 @@
 // it directly.
 #include "common/scratch_alloc.h"
 
+// Runtime pixel layouts (color_ramp_setup). The Pebble shims set 0: that
+// build has one encoding and no room for the tables.
+#ifndef RENDER_CTX_LAYOUTS
+#define RENDER_CTX_LAYOUTS 1
+#endif
+
 // The stateful layer above render_lowspec.h -- see render_ctx.h for the model
 // (layering, borrowed provisioning, the script-facing API spec). Every body
 // here is a target resolve, an argument shift and a forward to render_*; all
@@ -54,6 +60,9 @@ static RSurface *render_ctx_target(RenderCtx *c)
         RSurface *top = &c->target_stack[c->target_depth - 1];
         return top->pixels ? top : 0;
     }
+#if RENDER_CTX_LAYOUTS
+    if (c->layout && !c->layout->key) rlayout_build(c->layout);
+#endif
     return c->screen.pixels ? &c->screen : 0;
 }
 
@@ -67,7 +76,21 @@ void render_ctx_bind_screen(RenderCtx *c, const RSurface *fb)
 {
     if (fb) c->screen = *fb;
     else    render_fill_bytes((unsigned char *)&c->screen, 0, (int)sizeof(c->screen));
+#if RENDER_CTX_LAYOUTS
+    if (c->layout) c->screen.layout = c->layout;
+#endif
 }
+
+#if RENDER_CTX_LAYOUTS
+int render_ctx_color_ramp_setup_i32(RenderCtx *c, int add, int bit_offset,
+                                    int low, int mid, int high)
+{
+    if (!c->layout) return 0;
+    if (!rlayout_set(c->layout, add, bit_offset, low, mid, high)) return 0;
+    c->screen.layout = c->layout;
+    return 1;
+}
+#endif
 
 // ---- drawing primitives --------------------------------------------------
 // Thin wrappers over render_lowspec.h's render_* (all behaviour lives THERE,

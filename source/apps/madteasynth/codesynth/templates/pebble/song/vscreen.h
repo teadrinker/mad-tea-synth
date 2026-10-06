@@ -45,6 +45,21 @@ void vscreen_text(int x, int y, int size, int stroke_width,
 int  vscreen_font_i32(int id);
 int  vscreen_text_align_i32(int id);
 
+// color_ramp_setup: the panel is GColor8, so only the (n*64, 0, 2,2,2) cube
+// layouts take. With constant arguments anything else fails the build.
+#if defined(__GNUC__)
+extern void color_ramp_setup_only_2_2_2_on_pebble(void)
+    __attribute__((error("color_ramp_setup: Pebble supports only (192, 0, 2, 2, 2)")));
+#endif
+static inline int vscreen_color_ramp_setup_i32(int add, int bit_offset, int low, int mid, int high) {
+    int ok = bit_offset == 0 && low == 2 && mid == 2 && high == 2 && (add & 0x3F) == 0 &&
+             add >= 0 && add <= 192;
+#if defined(__GNUC__)
+    if (__builtin_constant_p(ok) && !ok) color_ramp_setup_only_2_2_2_on_pebble();
+#endif
+    return ok;
+}
+
 // ---- off-screen image targets ----
 int  vscreen_image_alloc_i32(int w, int h);
 int  vscreen_image_getpixel_i32(int image_id, int x, int y);

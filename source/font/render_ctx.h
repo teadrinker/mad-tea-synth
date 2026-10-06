@@ -56,13 +56,13 @@
 // text() returns a value (the VM has no void type); only image_alloc,
 // image_getpixel, image_sample and push_target return one worth reading.
 //
-//  putpixel(x:i32, y:i32, c:i32)                                       visual  one pixel to GColor8 c; off-screen dropped
+//  putpixel(x:i32, y:i32, color:i32)                                   visual  one pixel to GColor8 color; off-screen dropped
 //  point(x:fx16, y:fx16, amount:fx16, blend:fx16(int))                 visual  antialiased point; amount = coverage
 //  line(x1,y1,x2,y2, stroke_width:fx16[, alpha:fx16, blend:fx16(int)]) visual  antialiased line; negative blend = triangle-fill backend (thick, no AA)
 //  ellipse(x,y, radius_w,radius_h:fx16[, alpha, blend])                visual  filled; negative radius_w = wireframe; radius<=1px draws a point
 //  circle(x,y, radius:fx16[, alpha, blend])                            visual  ellipse(radius,radius)
-//  rect(x,y,w,h:fx16, col:fx16(int)[, alpha, blend])                   visual  filled w*h in GColor8 col; blend 0=screen, 1=inverted
-//  background(col:fx16(int)[, transparency:fx16])                      visual  fill the whole target
+//  rect(x,y,w,h:fx16, color:fx16(int)[, alpha, blend])                 visual  filled w*h in GColor8 color; blend 0=screen, 1=inverted
+//  background(color:fx16(int)[, transparency:fx16])                    visual  fill the whole target
 //  glyph(x,y,size,stroke_width:fx16, ascii:fx16(int)[, alpha, blend])  visual  stroke one glyph (digits + capitals; lowercase folded)
 //  text(x,y,size,stroke_width:fx16, "str":slice[, alpha, blend,
 //       letter_spacing:fx16, line_height:fx16])                        visual  stroke a string, advancing x per glyph; the only void-returning call
@@ -73,6 +73,7 @@
 //  image_sample(image_id:fx16(int), x:fx16, y:fx16)                    visual  image_getpixel, bilinear: fractional (x,y), and the RETURN is fx16
 //  push_target(image_id:i32)                                           visual  redirect every later draw into that image; 1 if it took, 0 if not
 //  pop_target()                                                        visual  restore the previous target; no-op when nothing is pushed
+//  color_ramp_setup(add:i32, bit_offset:i32, low:i32[, mid:i32, high:i32]) visual  how a screen byte splits into channels (common/render_layout.h); 1 if it took
 //  smp(rate, filter)                                                   audio   stream this voice's WAV sample at playback ratio `rate`
 //
 // `width` / `height` are registered alongside these (CodeSynthRegisterScreenConsts)
@@ -88,9 +89,24 @@
 // platform wrappers. Every path honours `alpha`, and alpha <= 0 short-circuits
 // before any geometry.
 //
-// `background` col is fx16(int) rather than a raw i32 so a fractional
+// `background` color is fx16(int) rather than a raw i32 so a fractional
 // `transparency` can share the call -- the register_c_func_*arg ABI applies one
 // shift to every arg. Integer colour literals round-trip unchanged.
+//
+// ---- color_ramp_setup ----------------------------------------------------
+// The screen byte is add + (P << bit_offset), P being the channels packed low
+// first; palette[] is the script's to fill to match. Pebble ships only the
+// default, (192,0,2,2,2) = GColor8 11RRGGBB. Lock bit 2 << n (blend 2, 4, 8)
+// leaves channel n alone, low first.
+//
+//     color_ramp_setup(0, 0, 4, 4)      // 16x16: two 4-bit layers
+//     color_ramp_setup(0, 0, 8)         // gray
+//     color_ramp_setup(32, 0, 4)        // a 16-step ramp at ids 32..47
+//     color_ramp_setup(1, 1, 4)         // 16 steps on the odd ids 1..31
+//
+// It needs low >= 1, bit_offset + all bits <= 8, the top id <= 255, and with
+// two or more channels `add` clear of the channel bits; otherwise it returns 0
+// and changes nothing. It does not clear the screen. Images stay 8-bit gray.
 //
 // ---- off-screen images (image_alloc / push_target) -----------------------
 // Every primitive draws into the CURRENT target: the screen, or the top of the
@@ -108,7 +124,7 @@
 // which is the point of drawing through it. This layer ORs BLEND_8BIT_GRAYSCALE
 // (common/render_surface.h) into the `blend` it hands each rasterizer, so no
 // script asks for it. Two consequences:
-//   - inside a push_target, a colour arg (putpixel's c, rect/background's col)
+//   - inside a push_target, a colour arg (putpixel's, rect's and background's color)
 //     is a 0-255 GRAY, and image_getpixel returns one.
 //   - to get an image back onto the screen, map that gray yourself:
 //     putpixel(x, y, image_getpixel(img,u,v) * 3 / 255 * 0b010101).
@@ -234,6 +250,13 @@ typedef struct RenderCtx {
     // 0 means the caller keeps its palette elsewhere; only that caller cares.
     int *palette;
     int  palette_len;
+
+    // ---- screen pixel layout (borrowed) ----
+    // What a screen byte means; the screen surface points at it. Built on the
+    // first draw (all-zero builds the GColor8 default), then by
+    // color_ramp_setup. 0 leaves the screen in render_lowspec's native encoding,
+    // which is all a Pebble build has.
+    struct RLayout *layout;
 } RenderCtx;
 
 // fb == 0 unbinds: every draw that would reach the screen is dropped, while
@@ -288,7 +311,7 @@ int  render_ctx_image_getpixel_i32(RenderCtx *c, int image_id, int x, int y);
 // a sample straddling the border fades to black rather than clamping outward.
 //
 // `image_id` rides the fx16 channel (one shift applies to every arg) and is
-// shifted back down here, like background's `col`.
+// shifted back down here, like background's `color`.
 int  render_ctx_image_sample_fx16(RenderCtx *c, int image_id, int x, int y);
 // 1 if the id resolved and the stack had room, 0 otherwise -- but a 0 still
 // consumes one pop_target, so every call needs its pop either way.
@@ -297,6 +320,11 @@ int  render_ctx_push_target_i32(RenderCtx *c, int image_id);
 // pop_target() is registered 1-arg with that argument defaulted, so scripts
 // still write `pop_target()`.
 int  render_ctx_pop_target_i32(RenderCtx *c, int unused);
+// color_ramp_setup: 1 and the screen re-laid-out, or 0 for invalid arguments
+// or a context with no layout. Not compiled when RENDER_CTX_LAYOUTS is 0.
+int  render_ctx_color_ramp_setup_i32(RenderCtx *c, int add, int bit_offset,
+                                     int low, int mid, int high);
+
 // Releases every image allocated since the last call and empties the target
 // stack -- the host calls it before each visual body, which is what makes ids
 // frame-temporary. A pointer rewind; safe when nothing was allocated.

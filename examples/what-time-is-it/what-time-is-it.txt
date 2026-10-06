@@ -485,7 +485,7 @@ if abs(stabby-b) > 0.5 then stabby = b
 
 #rewire f64 -> fx22
   
-smp(rate-cos01(beat*0.012)*0.0005*pan, 0.2)  
+smp(rate-cos01(beat*0.012)*0.0002*pan, 0.2)  
 // smp(rate, -0.25)*  1.7
 
 // visual \\
@@ -647,9 +647,9 @@ for span in spans
         if sync == 0 
             line(p1[0],p1[1], p2[0],p2[1], lineWid,1,0);
         else
-            line(p1[0]+sync*20,p1[1], p2[0]+sync*20,p2[1], lineWid,1,2|4)
+            line(p1[0]-sync*20,p1[1], p2[0]+sync*20,p2[1], lineWid,1,2|4)
             line(p1[0]+sync*10,p1[1], p2[0]+sync*10,p2[1], lineWid,1,2|8)
-            line(p1[0]-sync*15,p1[1], p2[0]-sync*15,p2[1], lineWid,1,4|8)
+            line(p1[0]+sync*15,p1[1], p2[0]-sync*15,p2[1], lineWid,1,4|8)
         i = i + 1
 
 rect(0, halfh - rh/2, width, rh, 0, 1.0, 1)

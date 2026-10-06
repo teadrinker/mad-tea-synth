@@ -742,6 +742,13 @@ typedef struct {
     // 1 = the variable of an unrolled loop. Its reads there were constants, so if
     // nothing else reads it (`used` still 0) its stores are dead and dropped.
     int      unrolled;
+    // 1 = a `for ... in` loop variable past its loop: the name no longer
+    // resolves, but the slot stays, and a later declaration of the same name
+    // and type takes it back (sym_declare).
+    int      hidden;
+    // 1 = declared while a hidden sym of the same name exists; the C emitter
+    // suffixes the name so the two never share a declaration.
+    int      name_dup;
 #if VM_REACTIVE
     // The fourth non-frame-owned kind (vm_reactive.h): a name the statement does
     // not declare, bound through the host's resolver. Storage IS an ordinary frame
@@ -855,6 +862,11 @@ typedef void (*VMInspectArrFn)(void *user, int id, int kind, int fx_shift,
 // inner call's report and its sink drops this id. A host that wants every
 // inspect() in the source can accept it instead.
 #define VM_INSPECT_ID_NONE (-1)
+
+// A node the compiler wraps as if the source said __ins(node, id), without the
+// source saying it (vm_set_inspect_probes).
+typedef struct VMProbe { struct ASTNode *node; int id; } VMProbe;
+#define VM_MAX_PROBES 32
 
 // How the code emitters treat an IR_PRINT node. The default is DROP, so a
 // script that prints still exports to a target with no print of its own.
@@ -995,6 +1007,7 @@ typedef struct Func {
     // small table or a deserialized Func, which sym_find then scans.
     int       *sym_index;
     int        sym_index_mask;
+    int        n_hidden;
 
     // Parameters
     int        n_params;
@@ -1022,6 +1035,15 @@ typedef struct Func {
     // as an fx16 constant instead of the plain 0 every other native default uses
     // -- see register_c_func_default_one. Compile-time only, like n_defaults.
     unsigned int native_default_one;
+
+    // NATIVES ONLY: the parameter names as written in a signature,
+    // "x0, y0, col" -- borrowed, host lifetime. For the editor's hints alone;
+    // see register_c_func_param_names. Compile-time only, like n_defaults.
+    const char *param_names;
+
+    // NATIVES ONLY: its value means nothing (draw calls) -- see
+    // register_c_func_no_value. For the editor's hints alone.
+    unsigned char native_no_value;
 
     // Return
     VMType     ret_type;
@@ -1216,6 +1238,10 @@ typedef struct VM {
         const char *c_name;
         const char *c_len_expr;
         int         declared;
+        // vm_place_host_buffer: where it sits in a flat linear memory.
+        int         mem_placed;
+        int         mem_addr;
+        int         mem_len;
     } host_bufs[VM_MAX_HOST_BUFS];
     // `#define`s in force, newest first. Cleared by func_create -- see VMDefine.
     VMDefine       *defines;
@@ -1323,6 +1349,13 @@ typedef struct VM {
     // match this unit's. Makes the error that says so stick: the lookup that failed
     // would otherwise be reported again, less usefully, as an unknown name.
     int             bind_failed;
+#if VM_HAS_INSPECT
+    // Copied in by vm_set_inspect_probes. probe_busy has bit i set while probe
+    // i's node is being compiled, so a re-entry on the same node wraps once.
+    VMProbe         probes[VM_MAX_PROBES];
+    int             n_probes;
+    unsigned int    probe_busy;
+#endif
 #if VM_REACTIVE
     // The host's resolver for names and component calls the unit does not
     // declare (vm_set_extern_resolver), and whether literal provenance is being

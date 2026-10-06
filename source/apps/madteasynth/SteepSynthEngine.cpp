@@ -200,6 +200,18 @@ bool SteepSynthEngine::CodeSynthLastVoiceArgs(double* out) const {
   return mCodeSynth && mCodeSynth->lastVoiceArgs(out);
 }
 
+void SteepSynthEngine::SetCodeSynthVisualProbes(const CodeSynthProbes& probes) {
+  if (mCodeSynth) mCodeSynth->setVisualProbes(probes);
+}
+
+void SteepSynthEngine::SetCodeSynthVisualProbeBody(const std::string& editorBody) {
+  if (mCodeSynth) mCodeSynth->setVisualProbeBody(editorBody);
+}
+
+void SteepSynthEngine::SetCodeSynthInspectListener(const CodeSynthInspectListener& listener) {
+  if (mCodeSynth) mCodeSynth->setInspectListener(listener);
+}
+
 const char* SteepSynthEngine::GetCodeSynthDebugMessage() const {
   return mCodeSynth ? mCodeSynth->GetLastDebugMessage() : "";
 }
@@ -394,6 +406,8 @@ bool SteepSynthEngine::LoadCodeFromFile() {
   if (!ReadWholeFile(mCodeFilePath, text)) return false;
 
   CodeSynthSetSourceText(text.data(), text.size());
+  // Another project must not inherit this one's values.
+  ResetCodeSynthGlobals();
   // Mark the file seen, so the next master tick doesn't reread it.
   mWatchValid = false;
   std::string ignored;
@@ -422,6 +436,10 @@ void SteepSynthEngine::PushCodeSynthLiveEdit() {
   mCodeSynth->LoadContent(text);
 }
 
+void SteepSynthEngine::ResetCodeSynthGlobals() {
+  if (mCodeSynth) mCodeSynth->requestGlobalsReset();
+}
+
 void SteepSynthEngine::SetVisualDelayMs(float ms) {
   if (mCodeSynth) mCodeSynth->setVisualDelayMs(ms);
 }
@@ -443,6 +461,12 @@ void SteepSynthEngine::SetVisualPreviewEntry(int idx) {
 
   // Entries store channels 1-based.
   cs->setVisualPreviewNote(mEntries[idx].channel - 1, mEntries[idx].note);
+}
+
+bool SteepSynthEngine::EntryVisuallyRendered(int idx) const {
+  if (!mCodeSynth || idx < 0 || idx >= (int)mEntries.size()) return false;
+  if (CodeSynthEntryIsReserved(mEntries[idx])) return false;
+  return mCodeSynth->visualNoteRendered(mEntries[idx].channel - 1, mEntries[idx].note);
 }
 
 int SteepSynthEngine::ExportSongTick() const {
@@ -783,7 +807,7 @@ void SteepSynthEngine::BuildMatrixFromRecording() {
   int maxCol = 0;
   for (size_t i = 0; i < mRecordedNotes.size(); i++) {
     const RecordedNote& n = mRecordedNotes[i];
-    int onCol  = (int)((n.samplePos - firstSamplePos) / samplesPerStep);
+    int onCol  = (int)((n.samplePos - firstSamplePos) / samplesPerStep + 0.5);
     int endCol;
     if (n.offSamplePos >= 0) {
       endCol = (int)((n.offSamplePos - firstSamplePos) / samplesPerStep + 0.5);

@@ -913,6 +913,7 @@ static void emit_local_name(Emit *e, int slot) {
         e->d->sym_name(e, e->cur_func, slot);
     } else if (s->name != 0) {
         ec_put_name(&e->out, intern_get_cstr(e->vm->intern, s->name));
+        if (s->name_dup) { buf_str(&e->out, "__"); buf_int(&e->out, (long long)slot); }
     } else {
         buf_str(&e->out, "__v");
         buf_int(&e->out, (long long)slot);

@@ -52,6 +52,8 @@ struct CodeSynthUiState
   // Fractions of the editor size; ignored while docked.
   float screenPosX    = 0.f;
   float screenPosY    = 0.f;
+  // Preview zoom in device pixels, kScreenZoomMin..kScreenZoomMax.
+  float screenZoom    = (float)kScreenZoom;
   // Only the first entryScrollCount are meaningful.
   CodeSynthEditorScroll entryScroll[kMaxCodeSynthScrollEntries];
   int   entryScrollCount = 0;

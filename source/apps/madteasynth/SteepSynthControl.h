@@ -84,15 +84,22 @@ constexpr int kMaxCodeSynthScrollEntries = 512;
 
 struct InteractiveCoding;
 
-// Device pixels, and an integer: a fractional zoom makes nearest-neighbour
-// sampling shimmer.
-constexpr int kScreenZoom   = 1;
-constexpr int kScreenMargin = 8;
-constexpr int kScreenPanelW = VSCREEN_W * kScreenZoom + kScreenMargin * 2;
+// Device pixels per preview pixel. Corner drags make it fractional; the bar's
+// < > step to whole numbers.
+constexpr int   kScreenZoom    = 1;
+constexpr float kScreenZoomMin = 0.25f;
+constexpr float kScreenZoomMax = 16.f;
+constexpr int   kScreenMargin  = 8;
+constexpr int   kScreenPanelW  = VSCREEN_W * kScreenZoom + kScreenMargin * 2;
 
 // kScreenGrab: how far outside the image a press still grabs the frame.
-constexpr float kScreenBezel = 5.f;
-constexpr float kScreenGrab  = 10.f;
+// kScreenCornerGrab: how far along the ring from a corner a press resizes instead.
+constexpr float kScreenBezel      = 5.f;
+constexpr float kScreenGrab       = 10.f;
+constexpr float kScreenCornerGrab = 16.f;
+constexpr float kScreenDividerGrab = 4.f;
+// A released resize within this fraction of a whole zoom lands on it.
+constexpr float kScreenZoomSnap = 0.04f;
 // How much of a dragged preview must stay inside the editor.
 constexpr float kScreenKeepVisible = 28.f;
 
@@ -122,7 +129,8 @@ public:
 
 private:
   void ReallocBackbuffer();
-  void RebuildUI(float fps);
+  // keepFonts: only the column split moved (a preview resize), so the glyphs still hold.
+  void RebuildUI(float fps, bool keepFonts = false);
 
   // Its own NanoVG image rather than part of the textmode backbuffer: the two
   // change on unrelated schedules.
@@ -130,7 +138,19 @@ private:
   void ReleaseScreenImage();
   // True when the textmode layout must regrid.
   bool SyncScreenResolutionAndDock();
+  bool ScreenImageRect(float& x, float& y, float& w, float& h) const;
+  // Drawn first in the frame, so its cells and presses win over a floating
+  // preview's editor underneath.
+  void DrawScreenBar();
+  bool HitScreenBar(float x, float y) const;
   bool HitScreenFrame(float x, float y) const;
+  // 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right; -1 for none.
+  int  HitScreenCorner(float x, float y) const;
+  // The docked panel's left edge; dragging it resizes the preview.
+  bool HitScreenDivider(float x, float y) const;
+  float MaxScreenZoom() const;
+  void ScreenResizeGrowsLeftUp(bool& left, bool& top) const;
+  void ResizeScreenTo(float x, float y, bool snap = false);
   void SetScreenPos(float x, float y);
   void DockScreen();
   void DrawCodeSynthEditor();
@@ -152,11 +172,33 @@ private:
     std::string lastSyncedBody;      // trimmed body matching both ic + model
     bool        isVisual = false;
     SteepSynthControl* owner = nullptr;
+
+    // The engine runs the bodies (host mode). codeSerial: the body last handed
+    // over; resultSerial: the one whose results were last reported. The
+    // editor's probe set, and whether the engine has it yet.
+    struct Probe { int id; size_t lo, hi; };
+    unsigned    codeSerial = 0;
+    unsigned    resultSerial = 0;
+    std::vector<Probe> probes;
+    unsigned    probeSerial = 0;
+    bool        probesDirty = false;
   };
 
-  // Fired on every successful live compile, scrubbing included.
-  static void OnCodeChanged(const char* body, void* user);
+  // Fired on every edit that parses, scrubbing included.
+  static void OnCodeChanged(const char* body, unsigned serial, void* user);
   void PushLiveEdit(const char* liveBody, CodeEditor& ed);
+
+  // Inspection. Visual: the probes go into the engine's visual pipeline, whose
+  // readings and first-run report come back through its listener. Sound: a
+  // probed copy of the open entry's body replayed here with the arguments the
+  // visual pipeline last used (SoundReplay, in the .cpp).
+  static void OnProbesChanged(const struct ICProbe* probes, int n, unsigned codeSerial,
+                              unsigned probeSerial, void* user);
+  void UpdateInspection();
+  void OnVisualRan(bool ok, const char* print, int printLen);
+  void ReplaySound();
+  struct SoundReplay;
+  SoundReplay* mSoundReplay = nullptr;
 
   // Supplies the sounding note's values as the wrapped body's arguments.
   static int OnWrapArgs(const char* params, char* out, int outMax, void* user);
@@ -212,6 +254,8 @@ private:
   Tsys         mSys;
   FontCache*   mFC = nullptr;
   FONT_SETTINGS mFontSettings;
+  int          mFontIndex = 0;
+  int          mFontApplied = 0;
   TextMode*    mTM = nullptr;
   UIContext*   mUI = nullptr;
 
@@ -237,7 +281,7 @@ private:
   unsigned int  mScreenGeneration = 0;
   bool          mScreenPebblePal = false;
   // mScreenPanelW is 0 while the preview floats.
-  int           mScreenZoomDev = kScreenZoom;
+  float         mScreenZoomDev = (float)kScreenZoom;
   float         mScreenPanelW = (float)kScreenPanelW;
 
   // `width`/`height` are folded, so a resize reaches bodies only by a recompile.
@@ -252,11 +296,33 @@ private:
   float         mScreenDrawW = 0.f, mScreenDrawH = 0.f;
   bool          mScreenDrawValid = false;
 
+  // A corner drag keeps the opposite corner fixed; docked, the top-right one.
+  int           mScreenResizeCorner = -1;
+  float         mScreenResizeAnchorX = 0.f, mScreenResizeAnchorY = 0.f;
+  // A divider drag is a corner drag (kScreenDividerCorner) that reads x only.
+  static constexpr int kScreenDividerCorner = 4;
+  bool          mScreenDividerHover = false;
+  bool          mScreenCursorSet = false;
+
+  // The fullscreen / zoom bar under the preview, in cells; 0 rows when not drawn.
+  float         mScreenBarCol = 0.f, mScreenBarRow = 0.f;
+  float         mScreenBarCols = 0.f;
+  int           mScreenBarRows = 0;
+
   // Every mouse event is swallowed while dragging.
   bool          mScreenDragging = false;
   float         mScreenDragOffX = 0.f, mScreenDragOffY = 0.f;
 
+  // The preview covers the whole control; any click ends it, and that click's
+  // drag/up are swallowed too.
+  bool          mScreenFullscreen = false;
+  bool          mScreenFullscreenExitHeld = false;
+  // Hosts like REAPER close the plugin window on Escape; it is ours while fullscreen.
+  bool          mEscapeCaptured = false;
+
+  // mCols stops short of a docked preview; mGridCols runs under it, for its bar.
   int           mCols = 80;
+  int           mGridCols = 80;
   int           mRows = 25;
   float         mCellW = 21.f;        // logical cell width  (for mouse coord conversion)
   float         mCellH = 43.f;        // logical cell height
@@ -271,10 +337,17 @@ private:
   static constexpr int kContentRow = 4;  // kSeqRow + 1 is left blank
 
   // Also used to size the preview before the editor is laid out.
-  static constexpr int kLeftColumnWidth = 18;
+  // Column 0 is the event list's marker column.
+  static constexpr int kLeftColumnWidth = 19;
   CodeEditor    mVisualEd;
   CodeEditor    mSoundEd;
   int           mSelectedSound = -1; // index into SteepSynth::CodeSynthEntry*, or -1
+
+  // The last selected event. A selected prelude block keeps it, so the screen keeps
+  // showing that event; the name re-finds it when inserts or deletes shift the index.
+  int           mContextEntry = -1;
+  std::string   mContextEntryName;
+  int ResolveContextEntry();
 
   std::string   mPendingDropCode;
 
@@ -358,8 +431,6 @@ private:
 
   // False while the buffer doesn't compile, hiding the stale trace.
   bool          mPreviewCodeOk = true;
-
-  int           mEditorCol = 0, mEditorRow = 0, mEditorW = 0, mEditorH = 0;
 
   int           mPreviewCol = 0, mPreviewRow = 0, mPreviewW = 0, mPreviewH = 0;
 };

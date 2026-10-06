@@ -61,6 +61,9 @@ static unsigned int ta_col_cursor(const UIContext *ui) {
 #define TA_KEY_A  PLATFORM_KEY_A
 #define TA_KEY_Z  PLATFORM_KEY_Z
 #define TA_KEY_Y  PLATFORM_KEY_Y
+#define TA_KEY_F  PLATFORM_KEY_F
+#define TA_KEY_F3     PLATFORM_KEY_F3
+#define TA_KEY_ESCAPE PLATFORM_KEY_ESCAPE
 
 // ===== internal types =====
 
@@ -90,6 +93,8 @@ typedef struct {
     int old_crow, old_ccol, old_srow, old_scol; float old_scroll;
     int new_crow, new_ccol, new_srow, new_scol; float new_scroll;
 } UndoGroup;
+
+typedef struct { int row, col, len; } FindMatch;
 
 struct UITextArea {
     Tsys *sys;
@@ -144,6 +149,18 @@ struct UITextArea {
 
     char *bound;  // ui_textarea_str: the text last shown from or handed to the model
 
+    bool single_line;  // Enter releases focus instead of inserting a line; paste drops newlines
+
+    // Ctrl+F find dialog
+    bool        find_open;
+    bool        find_grab_focus;   // put keyboard focus in the query field on the next draw
+    bool        find_reveal;       // scroll the current match into view on the next draw
+    UITextArea *find_ta;           // the query field (created on first open)
+    char       *find_query;        // query the match list was built for
+    FindMatch  *find_m;
+    int         find_n, find_cap;
+    int         find_cur;          // index into find_m, -1 when none
+    int         find_x, find_y, find_w;  // where the dialog was drawn last frame
 
 };
 
@@ -624,6 +641,13 @@ UITextArea *ui_textarea_create(Tsys *sys) {
     ta->drag_target_row   = ta->drag_target_col   = 0;
     ta->drag_press_row    = ta->drag_press_col    = 0;
     ta->bound = NULL;
+    ta->single_line = false;
+    ta->find_open = ta->find_grab_focus = ta->find_reveal = false;
+    ta->find_ta = NULL;
+    ta->find_query = NULL;
+    ta->find_m = NULL;
+    ta->find_n = ta->find_cap = 0;
+    ta->find_cur = -1;
 
     ta->cap_lines = 64;
     ta->lines = (Line *)sys->malloc(sizeof(Line) * ta->cap_lines);
@@ -650,12 +674,19 @@ void ui_textarea_destroy(UITextArea *ta) {
     if (ta->lines) sys->free(ta->lines);
     if (ta->vis)   sys->free(ta->vis);
     if (ta->bound) sys->free(ta->bound);
+    if (ta->find_query) sys->free(ta->find_query);
+    if (ta->find_m) sys->free(ta->find_m);
+    ui_textarea_destroy(ta->find_ta);
     undo_destroy(ta);
     sys->free(ta);
 }
 
 void ui_textarea_set_callbacks(UITextArea *ta, UITextAreaCallbacks *callbacks) {
     ta->callbacks = callbacks;
+}
+
+void ui_textarea_set_single_line(UITextArea *ta, bool single_line) {
+    ta->single_line = single_line;
 }
 
 void ui_textarea_set_show_line_numbers(UITextArea *ta, bool show) {
@@ -1192,6 +1223,7 @@ char *ui_textarea_get_text(UITextArea *ta) {
 bool ui_textarea_int_absolute_pos(UIContext *ui, UITextArea *ta, int *value,
                                   int min_value, int max_value,
                                   int x, int y, int w) {
+    ta->single_line = true;
     bool focused = (ui->focus_id == ui_id_from_ptr(ta));
 
     if (!focused) {
@@ -1229,6 +1261,7 @@ bool ui_textarea_int_absolute_pos(UIContext *ui, UITextArea *ta, int *value,
 
 const char *ui_textarea_str_absolute_pos(UIContext *ui, UITextArea *ta, const char *model,
                                          const char *strip, int x, int y, int w) {
+    ta->single_line = true;
     if (!model) model = "";
     if (!ta->bound || s_strcmp(ta->bound, model) != 0) {
         ui_textarea_set_text(ta, model, false);
@@ -1460,6 +1493,7 @@ static int paste_from_clipboard(UITextArea *ta) {
     for (int i = 0; ; i++) {
         char ch = t[i];
         if (ch == '\r') continue;
+        if (ch == '\n' && ta->single_line) continue;
         if (ch == '\n' || ch == '\0') {
             if (run_pos > 0) {
                 insert_chars_bulk(ta, ta->cur_row, ta->cur_col, run_buf, run_pos);
@@ -1831,6 +1865,277 @@ static void cursor_in_viz(UITextArea *ta, int x, int y, int w, int h,
     }
 }
 
+// ===== find (Ctrl+F) =====
+
+// Same green as a pinned inspection (COL_INSPECT in interactive_coding).
+static unsigned int ta_col_find(const UIContext *ui) {
+    return ui_adjust_color_additive(ui, ui_theme_color(ui, UI_COL_GREEN_ACCENT), 8, 0);
+}
+
+static unsigned char find_lower(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') ? (unsigned char)(c + 32) : c;
+}
+
+static char *find_dup(UITextArea *ta, const char *s) {
+    int n = (int)s_strlen(s);
+    char *d = (char *)ta->sys->malloc(n + 1);
+    ta->sys->memcpy(d, s, n + 1);
+    return d;
+}
+
+static void find_set_query(UITextArea *ta, char *owned) {
+    if (ta->find_query) ta->sys->free(ta->find_query);
+    ta->find_query = owned;
+}
+
+static void find_add(UITextArea *ta, int row, int col, int len) {
+    if (ta->find_n >= ta->find_cap) {
+        ta->find_cap = ta->find_cap * 2 + 32;
+        ta->find_m = (FindMatch *)ta->sys->realloc(ta->find_m, sizeof(FindMatch) * ta->find_cap);
+    }
+    FindMatch *m = &ta->find_m[ta->find_n++];
+    m->row = row; m->col = col; m->len = len;
+}
+
+static void find_rebuild(UITextArea *ta, const char *q) {
+    ta->find_n = 0;
+    int ql = (int)s_strlen(q);
+    if (ql == 0) return;
+    for (int r = 0; r < ta->num_lines; r++) {
+        const char *t = ta->lines[r].text;
+        int L = t ? ta->lines[r].length : 0;
+        for (int c = 0; c + ql <= L; ) {
+            int k = 0;
+            while (k < ql && find_lower((unsigned char)t[c + k]) == find_lower((unsigned char)q[k])) k++;
+            if (k == ql) { find_add(ta, r, c, ql); c += ql; }
+            else c++;
+        }
+    }
+}
+
+// First match at or after the selection start (else the caret), wrapping.
+static void find_pick_from_cursor(UITextArea *ta) {
+    ta->find_cur = ta->find_n > 0 ? 0 : -1;
+    int r = ta->cur_row, c = ta->cur_col;
+    if (ta->sel_row != -1 && (ta->sel_row < r || (ta->sel_row == r && ta->sel_col < c))) {
+        r = ta->sel_row; c = ta->sel_col;
+    }
+    for (int i = 0; i < ta->find_n; i++) {
+        FindMatch *m = &ta->find_m[i];
+        if (m->row > r || (m->row == r && m->col >= c)) { ta->find_cur = i; break; }
+    }
+    ta->find_reveal = true;
+}
+
+static void find_step(UITextArea *ta, int dir) {
+    if (ta->find_n <= 0) return;
+    if (ta->find_cur < 0 || ta->find_cur >= ta->find_n) find_pick_from_cursor(ta);
+    else ta->find_cur = (ta->find_cur + dir + ta->find_n) % ta->find_n;
+    FindMatch *m = &ta->find_m[ta->find_cur];
+    ta->sel_row = m->row; ta->sel_col = m->col;
+    ta->cur_row = m->row; ta->cur_col = m->col + m->len;
+    clamp_cursor(ta);
+    ta->find_reveal = true;
+}
+
+static void find_close(UIContext *ui, UITextArea *ta) {
+    if (ta->find_ta && ui->focus_id == ui_id_from_ptr(ta->find_ta)) ui->focus_id = ui_id_from_ptr(ta);
+    ta->find_open = false;
+    ta->find_grab_focus = false;
+    ta->find_reveal = false;
+    ta->find_n = 0;
+    ta->find_cur = -1;
+}
+
+void ui_textarea_find_open(UITextArea *ta) {
+    ta->find_open = true;
+    ta->find_grab_focus = true;
+    ta->find_cur = -1;
+    char *sel = get_selection_text(ta);
+    if (sel && sel[0] && !s_strchr(sel, 10)) find_set_query(ta, sel);
+    else if (sel) ta->sys->free(sel);
+}
+
+bool ui_textarea_has_focus(UIContext *ui, UITextArea *ta) {
+    if (ui->focus_id == ui_id_from_ptr(ta)) return true;
+    return ta->find_open && ta->find_ta && ui->focus_id == ui_id_from_ptr(ta->find_ta);
+}
+
+static void find_reveal_current(UITextArea *ta, int text_width, int usable) {
+    ta->find_reveal = false;
+    if (ta->find_cur < 0 || ta->find_cur >= ta->find_n) return;
+    FindMatch *m = &ta->find_m[ta->find_cur];
+    int idx, vcol;
+    get_visual_coords(ta, m->row, m->col, text_width, &idx, &vcol);
+    if (usable < 1) usable = 1;
+    int   si;
+    float sf;
+    scroll_split(ta, &si, &sf);
+    if (idx >= si && idx < si + usable) return;
+    float old_scroll = ta->scroll;
+    ta->scroll = (float)(idx - usable / 2);
+    if (ta->scroll < 0.0f) ta->scroll = 0.0f;
+    if (old_scroll != ta->scroll && ta->callbacks && ta->callbacks->on_scroll)
+        ta->callbacks->on_scroll(ta->callbacks->user, ta);
+}
+
+enum { FIND_LABEL_W = 5, FIND_FIELD_W = 12, FIND_COUNT_W = 9, FIND_BTN_W = 3, FIND_FIXED_W = 30 };
+
+// ui_draw_text only writes printable ASCII, so a glyph slot goes in as a cell of its own,
+// keeping the colour the button just gave that cell (hover, pressed).
+static void find_glyph_on_button(UIContext *ui, int x, int y, unsigned char glyph) {
+    OutputCell cell;
+    if (!ui_get_cell(ui, x, y, &cell)) return;
+    ui_draw_cell_raw(ui, x, y, glyph, cell.color, ui->global_scale, ui->global_weight, 0.0f, 0.0f, true, 0);
+}
+
+// Draws the one-row dialog at the top right of the text area, left of the
+// scrollbar, and keeps the match list current. It runs before the text is drawn:
+// the first draw to a cell wins.
+static void find_dialog(UIContext *ui, UITextArea *ta, int x, int y, int w, int scrollbar_w) {
+    if (!ta->find_ta) {
+        ta->find_ta = ui_textarea_create(ta->sys);
+        ui_textarea_set_show_line_numbers(ta->find_ta, false);
+        ui_textarea_set_show_bottom_status(ta->find_ta, false);
+    }
+    UITextArea *q = ta->find_ta;
+    int qid = ui_id_from_ptr(q);
+
+    int avail = w - scrollbar_w;
+    int fw = FIND_FIELD_W;
+    if (FIND_FIXED_W + fw > avail) fw = avail - FIND_FIXED_W;
+    if (fw < 3) fw = 3;
+    int total = FIND_FIXED_W + fw;
+    int dx = x + avail - total;
+    if (dx < x) dx = x;
+    ta->find_x = dx; ta->find_y = y; ta->find_w = total;
+
+    bool grab = ta->find_grab_focus;
+    ta->find_grab_focus = false;
+    if (grab) ui->focus_id = qid;
+
+    // Enter / Shift+Enter, F3 and Escape belong to the dialog, not to the query field.
+    bool select_all = grab;
+    if (ui->focus_id == qid) {
+        int n = 0;
+        for (int i = 0; i < ui->num_key_events; i++) {
+            int key = ui->key_events[i], kf = ui->key_flags[i];
+            int dir = (kf & UI_FLAGS_SHIFT) ? -1 : 1;
+            if (key == TA_KEY_ENTER || key == TA_KEY_F3) find_step(ta, dir);
+            else if (key == TA_KEY_ESCAPE) find_close(ui, ta);
+            else if ((kf & UI_FLAGS_CTRL) && key == TA_KEY_F) select_all = true;
+            else { ui->key_events[n] = key; ui->key_flags[n] = kf; n++; }
+        }
+        ui->num_key_events = n;
+        if (!ta->find_open) return;
+    }
+
+    float pen_x = ui->pen_x, pen_y = ui->pen_y, line_start_x = ui->line_start_x;
+    float content_max_x = ui->content_max_x;
+    float last_x = ui->last_x, last_y = ui->last_y, last_w = ui->last_w, last_h = ui->last_h;
+    int   item_width_sp = ui->item_width_sp;
+    ui->item_width_sp = 0;
+    ui_push_clip_rect(ui, (float)x, (float)y, (float)w, 1.0f);
+    ui_push_id_ptr(ui, ta);
+
+    unsigned int panel = ui_theme_color(ui, UI_COL_LABEL);
+    ui_draw_text(ui, (float)(dx + 1), (float)y, "Find:", panel);
+
+    bool first = ta->find_cur < 0;
+    const char *edited = ui_textarea_str_absolute_pos(ui, q, ta->find_query ? ta->find_query : "",
+                                                      NULL, dx + 7, y, fw);
+    if (select_all) {
+        q->sel_row = 0; q->sel_col = 0;
+        q->cur_row = q->num_lines - 1;
+        q->cur_col = q->lines[q->cur_row].length;
+    }
+    if (edited) find_set_query(ta, find_dup(ta, edited));
+    find_rebuild(ta, ta->find_query ? ta->find_query : "");
+    if (edited || (first && ta->find_n > 0)) find_pick_from_cursor(ta);
+    else if (ta->find_cur >= ta->find_n) ta->find_cur = ta->find_n - 1;
+
+    ui_set_cursor_column(ui, (float)(dx + 8 + fw + FIND_COUNT_W + 1), (float)y, (float)(total + 8));
+    int  bx = (int)ui->pen_x;
+    bool up    = ui_button(ui, " ##up");
+    find_glyph_on_button(ui, bx + 1, y, UI_CHAR_TRIANGLE_UP);
+    ui_same_line(ui);
+    bool down  = ui_button(ui, " ##down");
+    find_glyph_on_button(ui, bx + 5, y, UI_CHAR_TRIANGLE_DOWN);
+    ui_same_line(ui);
+    bool close = ui_button(ui, "x");
+    if (up)   find_step(ta, -1);
+    if (down) find_step(ta, 1);
+
+    char count[24];
+    s_snprintf(count, sizeof(count), "%d of %d", ta->find_cur + 1, ta->find_n);
+    ui_draw_text(ui, (float)(dx + 8 + fw), (float)y, count, panel);
+
+    ui_fill_rect(ui, (float)dx, (float)y, total, 1, ' ', panel);
+
+    ui_pop_id(ui);
+    ui_pop_clip_rect(ui);
+    ui->item_width_sp = item_width_sp;
+    ui->pen_x = pen_x; ui->pen_y = pen_y; ui->line_start_x = line_start_x;
+    ui->content_max_x = content_max_x;
+    ui->last_x = last_x; ui->last_y = last_y; ui->last_w = last_w; ui->last_h = last_h;
+    if (close) find_close(ui, ta);
+}
+
+// Recolours the cell ui_draw_cell_flags just put at (sx, sy) -- after the draw, so it
+// holds whether the cell came from the default path or from draw_cell_override.
+static void find_recolor_cell(UIContext *ui, float sx, float sy, bool current) {
+    int cx = (int)(sx + 0.5f), cy = (int)(sy + 0.5f);
+    if (cx < ui->clip_x0 || cx >= ui->clip_x1 || cy < ui->clip_y0 || cy >= ui->clip_y1) return;
+    if (cx < 0 || cx >= ui->cols || cy < 0 || cy >= ui->rows) return;
+    OutputCell *c = &ui->screen[cy * ui->cols + cx];
+    unsigned int g  = ta_col_find(ui);
+    unsigned int bg = current ? TM_COLOR_BG(ta_col_selection(ui)) : TM_COLOR_BG(c->color);
+    c->color = TM_COLOR_PACK(TM_COLOR_FG(g), TM_COLOR_GRADIENT(g), bg);
+}
+
+// First match on `row` or later; matches are in document order.
+static int find_first_on_row(UITextArea *ta, int row) {
+    int lo = 0, hi = ta->find_n;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (ta->find_m[mid].row < row) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+// The column left of the scrollbar: the whole text stretched over the scrollbar's draggable
+// range only (not its two arrow cells), '-' where one match lands in a cell, '=' for several.
+static void find_scrollbar_ticks(UIContext *ui, UITextArea *ta, int text_width, int x, int y, int h) {
+    unsigned int bg = TM_COLOR_BG(ui_theme_color(ui, UI_COL_DEFAULT));
+    int track = h - 2;
+    if (ta->num_vis > 0 && track > 0) {
+        unsigned int g = ta_col_find(ui);
+        unsigned int g_cur = ui_adjust_color_additive(ui, g, 40, 0);
+        int vi = 0;
+        for (int i = 0; i < ta->find_n; ) {
+            int ty = -1, count = 0;
+            bool current = false;
+            for (; i < ta->find_n; i++) {
+                FindMatch *m = &ta->find_m[i];
+                while (vi < ta->num_vis - 1 && ta->vis[vi].logical_row < m->row) vi++;
+                int idx = vi + m->col / text_width;
+                if (idx >= ta->num_vis) idx = ta->num_vis - 1;
+                int t = (int)((float)idx / (float)ta->num_vis * (float)track);
+                if (t >= track) t = track - 1;
+                if (ty >= 0 && t != ty) break;
+                ty = t;
+                count++;
+                if (i == ta->find_cur) current = true;
+            }
+            unsigned int col = current ? g_cur : g;
+            ui_draw_cell(ui, (float)x, (float)(y + 1 + ty), count > 1 ? '=' : '-',
+                         TM_COLOR_PACK(TM_COLOR_FG(col), TM_COLOR_GRADIENT(col), bg));
+        }
+    }
+    ui_fill_rect(ui, (float)x, (float)y, 1, h, ' ', ui_theme_color(ui, UI_COL_DEFAULT));
+}
+
 // ===== render + widget =====
 
 // The two layout-participating entry points, thin over the pinned forms below.
@@ -1891,10 +2196,12 @@ int ui_textarea_absolute_pos(UIContext *ui, UITextArea *ta, int x, int y, int w,
     rebuild_layout(ta, text_width);
     int has_scrollbar = (ta->num_vis > content_h) || (ta->scroll > 0);
     int scrollbar_w = has_scrollbar ? 1 : 0;
+    // While find is open the column left of the scrollbar belongs to the match ticks.
+    int find_col = (ta->find_open && has_scrollbar) ? 1 : 0;
 
     // If scrollbar is needed, recompute layout with reduced width for word-wrap
     if (has_scrollbar) {
-        text_width = w - ta->gutter - scrollbar_w;
+        text_width = w - ta->gutter - scrollbar_w - find_col;
         if (text_width < 1) text_width = 1;
         rebuild_layout(ta, text_width);
     }
@@ -1912,6 +2219,9 @@ int ui_textarea_absolute_pos(UIContext *ui, UITextArea *ta, int x, int y, int w,
         if (ta->scroll > max_scroll) ta->scroll = max_scroll;
         if (ta->scroll < 0.0f)       ta->scroll = 0.0f;
     }
+
+    bool find_fits = !ta->single_line && !disabled && content_h >= 2 && w - scrollbar_w >= 12;
+    if (ta->find_open && !find_fits) find_close(ui, ta);
 
     // Pre-check: is the cursor cell free (no overlay drawn there yet)?
     // (no caret when the window itself doesn't have keyboard focus)
@@ -1934,7 +2244,9 @@ int ui_textarea_absolute_pos(UIContext *ui, UITextArea *ta, int x, int y, int w,
     float mrow_f = ui->mouse_y - (float)y;
     // Exclude scrollbar column from text-area mouse handling.
 // Wheel events still work over the full area (see below).
-    int inside   = (mc >= 0 && mc < w - scrollbar_w && mr >= 0 && mr < content_h);
+    int inside   = (mc >= 0 && mc < w - scrollbar_w - find_col && mr >= 0 && mr < content_h);
+    if (ta->find_open && (int)ui->mouse_x >= ta->find_x && (int)ui->mouse_x < ta->find_x + ta->find_w &&
+        (int)ui->mouse_y == ta->find_y) inside = 0;
 
     // A press only reaches the textarea if no other control already captured the
     // mouse this frame. Widgets drawn before us grab on the press edge (ui_hit
@@ -2242,10 +2554,17 @@ int ui_textarea_absolute_pos(UIContext *ui, UITextArea *ta, int x, int y, int w,
         if (has_events)
             undo_begin_edit(ta);
 
-        for (int i = 0; i < ui->num_key_events; i++)
-            changed |= handle_key(ta, ui->key_events[i], ui->key_flags[i], text_width);
-        for (int i = 0; i < ui->num_char_events; i++)
-            changed |= handle_char(ta, ui->char_events[i], ui->char_flags[i]);
+        for (int i = 0; i < ui->num_key_events; i++) {
+            int key = ui->key_events[i], kf = ui->key_flags[i];
+            if (ta->single_line && key == TA_KEY_ENTER) { ui->focus_id = UI_FOCUS_RELEASED; break; }
+            if (find_fits && (kf & UI_FLAGS_CTRL) && key == TA_KEY_F) { ui_textarea_find_open(ta); continue; }
+            if (ta->find_open && key == TA_KEY_ESCAPE) { find_close(ui, ta); continue; }
+            if (ta->find_open && key == TA_KEY_F3) { find_step(ta, (kf & UI_FLAGS_SHIFT) ? -1 : 1); continue; }
+            changed |= handle_key(ta, key, kf, text_width);
+        }
+        if (ui->focus_id == id)
+            for (int i = 0; i < ui->num_char_events; i++)
+                changed |= handle_char(ta, ui->char_events[i], ui->char_flags[i]);
         if (changed) {
             if (ta->callbacks && ta->callbacks->on_content_updated)
                 ta->callbacks->on_content_updated(ta->callbacks->user, ta);
@@ -2258,8 +2577,23 @@ int ui_textarea_absolute_pos(UIContext *ui, UITextArea *ta, int x, int y, int w,
     }
 
     // ---- render ----
+    // Find may have opened or closed above: the tick column appears and goes with it.
+    {
+        int want = (ta->find_open && has_scrollbar) ? 1 : 0;
+        if (want != find_col) {
+            find_col = want;
+            text_width = w - ta->gutter - scrollbar_w - find_col;
+            if (text_width < 1) text_width = 1;
+        }
+    }
     rebuild_layout(ta, text_width);
     ta->text_width = text_width;
+
+    if (ta->find_open) {
+        find_dialog(ui, ta, x, y, w, scrollbar_w);
+        if (ta->find_open) ui->wants_escape = 1;
+        if (ta->find_open && ta->find_reveal) find_reveal_current(ta, text_width, content_h_draw);
+    }
 
     // ---- scrollbar (drawn first so content blank rows don't claim its cells) ----
     if (has_scrollbar) {
@@ -2276,6 +2610,7 @@ int ui_textarea_absolute_pos(UIContext *ui, UITextArea *ta, int x, int y, int w,
         }
         if (old_scroll != ta->scroll && ta->callbacks && ta->callbacks->on_scroll)
             ta->callbacks->on_scroll(ta->callbacks->user, ta);
+        if (find_col) find_scrollbar_ticks(ui, ta, text_width, x + w - 1 - scrollbar_w, y, content_h);
     }
 
     // Track the cursor's float position during the render loop
@@ -2350,7 +2685,7 @@ int ui_textarea_absolute_pos(UIContext *ui, UITextArea *ta, int x, int y, int w,
             // --- text cells ---
             char *txt = ta->lines[lrow].text;
             bool is_last_seg = (vl->char_offset + vl->length == ta->lines[lrow].length);
-
+            int  fmi = ta->find_open ? find_first_on_row(ta, lrow) : ta->find_n;
 
             for (int c = 0; sx < (float)(x + ta->gutter + text_width); c++) {
                 unsigned char ch = ' ';
@@ -2370,12 +2705,20 @@ int ui_textarea_absolute_pos(UIContext *ui, UITextArea *ta, int x, int y, int w,
                     (!drawing_content && c == vl->length && is_last_seg &&
                      ta->lines[lrow].lineTag != 0);
 
+                float cell_sx = sx;
                 if (call_override && ta->callbacks && ta->callbacks->draw_cell_override) {
                     sx += ta->callbacks->draw_cell_override(
                         ta->callbacks->user, ui, ta, lrow, lcol, sx, sy, ch, color, clipflags);
                 } else {
                     ui_draw_cell_flags(ui, sx, sy, ch, color, clipflags);
                     sx += 1.0f;
+                }
+
+                if (drawing_content && fmi < ta->find_n) {
+                    while (fmi < ta->find_n && ta->find_m[fmi].row == lrow &&
+                           ta->find_m[fmi].col + ta->find_m[fmi].len <= lcol) fmi++;
+                    if (fmi < ta->find_n && ta->find_m[fmi].row == lrow && ta->find_m[fmi].col <= lcol)
+                        find_recolor_cell(ui, cell_sx, sy, fmi == ta->find_cur);
                 }
             }
 

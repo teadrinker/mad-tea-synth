@@ -33,7 +33,7 @@
 // the rest pins in source order. A site past the cap keeps its inspect(...)
 // wrapper -- the text must never silently differ from what runs -- but gets no
 // id, no label and no results line.
-#define IC_INSPECT_MAX_SITES 16
+#define IC_INSPECT_MAX_SITES IC_PROBES_MAX
 #define IC_INSPECT_ID_HOVER  0
 
 // How long a newly hovered expression has to be held before it is inspected,
@@ -41,9 +41,118 @@
 // line must not pay for every token on the way.
 #define IC_INSPECT_HOVER_DELAY 0.15f
 
+// An element index over a comma of an array literal is rarely what the pointer
+// is asking about, so it waits longer than a reading.
+#define IC_INSPECT_INDEX_DELAY 0.5f
+
 // Width of one pinned reading's line in the results panel. Not the panel's own
 // width: it scrolls and resizes under the text, so a measured one goes stale.
 #define IC_INSPECT_LINE_MAX  96
+
+// ---------------------------------------------------------------------------
+// Overlay labels
+// ---------------------------------------------------------------------------
+// A short-lived block of text that wants a free spot near some code this frame:
+// an inspection reading, an argument hint, a completion menu. One layer places,
+// claims and paints them all, so they never fight over the same cells.
+#define IC_OV_MAX_ROWS   48
+#define IC_OV_TEXT_MAX   8192
+#define IC_OV_MAX_LABELS (IC_INSPECT_MAX_SITES + 4)
+#define IC_OV_MAX_RECTS  (3 * IC_INSPECT_MAX_SITES + 2 * IC_OV_MAX_ROWS)
+
+typedef enum { IC_OV_PIN, IC_OV_HOVER, IC_OV_HINT, IC_OV_WARN, IC_OV_MENU } ICOverlayKind;
+
+// Keep clear of the cells right of the anchor on its own row: the caret is
+// about to type into them.
+#define IC_OV_NO_SAME_ROW_RIGHT (1u << 0)
+// Try the row under the anchor before the one over it.
+#define IC_OV_PREFER_BELOW      (1u << 1)
+// Never split a long label over several rows.
+#define IC_OV_ONE_ROW           (1u << 2)
+// On the anchor's own row, from two cells past it, over whatever is there.
+#define IC_OV_SAME_ROW          (1u << 3)
+// Exactly at (at_x, at_y): the caller has already found the cells free.
+#define IC_OV_AT                (1u << 4)
+
+// Where a label was last placed, so a pin does not re-search every frame.
+// placed == 0 is "not placed yet"; place_avail == 0 is "placed, nowhere to put
+// it", which draws nothing without re-searching. place_ax/ay is the screen
+// anchor the search ran against, so scroll, resize and rewrap are all detected
+// by the anchor having moved.
+typedef struct {
+    float place_x, place_y;
+    float place_ax, place_ay;
+    float place_ax2, place_ay2;
+    int   place_avail;
+    int   place_rows;       // 2 or 3 when a long label was split over rows
+    int   place_alt;        // which of text / alt_text was placed
+    int   placed;
+} ICOverlayCache;
+
+typedef struct {
+    ICOverlayKind   kind;
+    // Must outlive the flush at the end of the frame. '\n' makes explicit rows.
+    const char     *text;
+    // Tried when `text` does not fit whole; may be a shorter or a taller form.
+    const char     *alt_text;
+    // The anchor span in BUFFER coordinates, (row, col) leftmost and
+    // (row2, col2) rightmost inclusive.
+    int             row, col, row2, col2;
+    float           focus_x;     // preferred centre in cells; < 0 = middle of the span
+    int             align_col;   // >= 0: put text[align_at] over this buffer column
+    int             align_at;
+    unsigned        flags;
+    ICOverlayCache *cache;       // NULL = placed afresh every frame
+    const char     *alt2_text;   // a third form, tried after alt_text
+    int             align_at_alt;   // align_at for alt_text
+    float           at_x, at_y;     // IC_OV_AT: the text's top left, screen cells
+} ICOverlayLabel;
+
+// The label layer (ic_overlay.c, #included by interactive_coding.c).
+void ic_overlay_begin(InteractiveCoding *ic);
+void ic_overlay_add(InteractiveCoding *ic, UIContext *ui, UITextArea *ta, const ICOverlayLabel *l);
+void ic_overlay_flush(InteractiveCoding *ic, UIContext *ui);
+
+// A run of cells one label has claimed, in screen coordinates.
+typedef struct { float x, y; int len; } ICOverlayRect;
+
+typedef struct {
+    const char   *label;
+    float         x, y, ay1;
+    int           avail, rows, r0;
+    ICOverlayKind kind;
+    bool          explicit_rows;
+    bool          fixed;        // never moved to separate it from another label
+} ICOverlayPlaced;
+
+typedef struct {
+    // Cells already claimed by a label this frame. First-draw-wins, so a second
+    // label overlapping a first disappears into it rather than blending.
+    ICOverlayRect   drawn[IC_OV_MAX_RECTS];
+    int             num_drawn;
+    // This frame's labels, placed and claimed but not yet painted, so two that
+    // ended up touching can still be pulled apart. r0 .. r0+rows-1 are its rows
+    // in `drawn`; ay1 the row its expression ends on.
+    ICOverlayPlaced placed[IC_OV_MAX_LABELS];
+    int             num_placed;
+    // Cached labels re-place themselves this frame (an edit moved free cells
+    // without moving any anchor).
+    int             force_place;
+    // The textarea this frame's labels were placed against, for the flush.
+    UITextArea     *ta;
+    // Constraints on the placement search in flight; see ic_overlay_add.
+    bool            block_right;
+    float           block_x, block_y;
+    bool            prefer_below;
+    // The argument hint was claimed this frame (it sits between pins and hover).
+    bool            hint_added;
+    // Where the menu label landed this frame. It is not painted by the flush:
+    // its owner draws buttons there.
+    bool            menu_placed;
+    const char     *menu_label;
+    float           menu_x, menu_y;
+    int             menu_avail, menu_rows;
+} ICOverlay;
 
 typedef struct {
     ICInspect stats;            // filled by the sink during the one private run
@@ -62,26 +171,8 @@ typedef struct {
     size_t    arg_lo,  arg_hi;
 
     // Cached placement, pins only -- the hover's is recomputed every frame.
-    // placed == 0 is "not placed yet"; place_avail == 0 is "placed, nowhere to
-    // put it", which draws nothing without re-searching. place_ax/ay is the
-    // screen anchor the search ran against, so scroll, resize and rewrap are
-    // all detected by the anchor having moved.
-    float     place_x, place_y;
-    float     place_ax, place_ay;
-    float     place_ax2, place_ay2;
-    int       place_avail;
-    int       place_rows;       // 2 or 3 when a long label was split over rows
-    int       placed;
+    ICOverlayCache cache;
 } ICInspectSite;
-
-// A run of cells one label has claimed, in screen coordinates.
-typedef struct { float x, y; int len; } ICInspectRect;
-
-typedef struct {
-    const char *label;
-    float       x, y, ay1;
-    int         avail, rows, pinned, r0;
-} ICInspectPlaced;
 
 // Ceiling on one run's print() output. Not a buffer size -- the buffer grows to
 // fit -- just where more output stops being useful and starts being a way for a
@@ -97,6 +188,57 @@ typedef struct {
 #define IC_RUN_OP_BUDGET 3200000
 
 typedef struct ICEditor ICEditor;
+
+// ---------------------------------------------------------------------------
+// Completion and argument help (ic_complete.c)
+// ---------------------------------------------------------------------------
+#define IC_NAME_MAX   48
+#define IC_PARAMS_MAX 192
+#define IC_TYPES_MAX  128
+
+// 0..5 are vm.h's VMNameKind, in order; the rest are names the buffer declares.
+typedef enum {
+    ICN_NATIVE, ICN_LIB, ICN_CONST, ICN_HOST_BUF, ICN_GLOBAL, ICN_INTRINSIC,
+    ICN_FUNC, ICN_VAR, ICN_PARAM, ICN_LOOPVAR, ICN_CONSTDECL, ICN_DEFINE, ICN_WRAP, ICN_OPTION, ICN_OPTION_ALT, ICN_DIRECTIVE
+} ICNameKind;
+
+typedef struct {
+    char name[IC_NAME_MAX];
+    int  kind;                  // ICNameKind
+    int  n_params;              // -1 = not callable
+    int  n_optional;            // trailing params with defaults
+    char params[IC_PARAMS_MAX]; // "x0, y0, col" -- or "" when unknown
+    char types[IC_TYPES_MAX];   // "f64, f64, ..." -- or "" when unknown
+    char ret[16];
+    int  scope_id;              // while collecting: the binding lambda, -1 = none
+    int  scope_lo, scope_hi;    // rows of that lambda; -1 when the name is global
+} ICName;
+
+typedef struct { ICName *v; int n, cap; } ICCatalog;
+
+typedef enum { IC_CALL_NONE, IC_CALL_CALL, IC_CALL_LITERAL, IC_CALL_INDEX } ICCallKind;
+
+// Where an offset sits in the call being written, read off the TEXT -- the
+// parse of `f(a, ` has failed exactly when the hint is wanted.
+typedef struct {
+    ICCallKind kind;
+    size_t     callee_lo, callee_hi;   // the name being called
+    int        arg_index;              // depth-0 commas before the offset
+    size_t     open_off;               // the `(` / `[`, or the end of a paren-less callee
+    bool       parens;                 // CALL written with `(`
+    bool       in_decl;                // a lambda's parameter list: not a call
+} ICCallCtx;
+
+bool ic_call_context(const char *text, size_t len, size_t off, ICCallCtx *out);
+
+#define IC_MENU_MAX_HITS 200
+#define IC_MENU_DIGITS   9
+#define IC_MENU_MAX_ROWS 40
+#define IC_HINT_TEXT     512
+#define IC_MENU_SEG_MAX  (IC_MENU_MAX_HITS + 1)
+
+typedef struct { int off, len, row, col, idx; } ICMenuSeg;
+typedef struct { float x, y; int w; } ICMenuBtn;
 
 // Fired after a successful run of `ed`, with the exact source that ran, so the
 // two run paths -- a normal run and a live scrub frame -- share one notion of
@@ -147,6 +289,16 @@ struct ICEditor {
     // pointer sits perfectly still.
     unsigned int run_serial;
 
+    // ---- host-run mode ----
+    // code_serial: bumped each time the body is handed to the code-changed
+    // callbacks. host_serial: the newest serial whose host results are shown.
+    // A host parse/compile error lives apart from the local stages, which win.
+    unsigned int code_serial;
+    unsigned int host_serial;
+    char        host_error[512];
+    bool        has_host_error;
+    int         host_error_row, host_error_col;
+
     // ---- print() output from the last run ----
     // Bytes exactly as print() produced them, one '\n' per call. array_clear'd
     // rather than freed at the start of each run: a scrub re-runs on every
@@ -174,7 +326,96 @@ struct ICEditor {
     // ---- post-run hook ----
     ICEditorRanFn on_ran;
     void         *on_ran_user;
+
+    // ---- completion ----
+    // The buffer as it stood at the last parse that succeeded: what the name
+    // catalog is read from while the live text does not parse.
+    char         *good_src;
+    // Bumped by every re-parse, i.e. by every change to the text.
+    unsigned int  edit_serial;
 };
+
+// Everything the three editing aids remember between frames.
+typedef struct {
+    bool       on;                  // interactive_coding_set_completion
+
+    // ---- argument hint: a typed comma or `(` ----
+    ICEditor  *hint_ed;
+    bool       hint_armed;          // set by on_insert_text, read next frame
+    bool       hint_on;
+    size_t     hint_open_off;
+    ICName     hint_sig;            // the callee as the catalog described it
+    unsigned   hint_serial;         // what hint_text was built for
+    int        hint_row, hint_col, hint_arg;
+    bool       hint_parens;
+    bool       hint_have;
+    bool       hint_warn;
+    char       hint_text[IC_HINT_TEXT];
+    char       hint_alt[IC_HINT_TEXT];
+
+    // ---- keyword clause hint: `for `, `while `, ... ----
+    ICEditor  *kw_ed;
+    int        kw_idx;              // 1 + index into the keyword table; 0 = none
+    int        kw_row, kw_col;      // the caret, as of the last frame
+
+    // ---- completion hint: the one completion Tab would write ----
+    bool       hints;               // the Hints box; per-keypress work, so it can go off
+    ICEditor  *ch_ed;
+    int        ch_row, ch_col;
+    unsigned   ch_serial;
+    char       ch_key[IC_NAME_MAX]; // the word the hint was built for
+    bool       ch_have;
+    bool       ch_tab;              // shown by Tab, kept while the caret stays put
+    char       ch_text[256], ch_alt[IC_NAME_MAX + 8];
+
+    // The names a VM enumerates for this host, built once per setup callback.
+    ICCatalog                   base;
+    bool                        base_ok;
+    InteractiveCodingVmSetupFn  base_setup;
+    void                       *base_user;
+
+    // ---- a hovered comma: the parameter names either side, or `id=N` ----
+    ICEditor  *cmh_ed;
+    int        cmh_row, cmh_col;
+    unsigned   cmh_serial;
+    float      cmh_since;
+    int        cmh_kind;            // 0 none, 1 call, 2 array literal
+    char       cmh_callee[IC_NAME_MAX];
+    int        cmh_arg;
+    bool       cmh_built;
+    char       cmh_text[160], cmh_alt[160];
+    int        cmh_align, cmh_align_alt;
+    bool       cmh_suppress;        // this frame: the value hover stands down
+
+    // ---- the Tab menu ----
+    bool       menu_open;
+    ICEditor  *menu_ed;
+    int        menu_row, menu_c0;
+    char       menu_q[IC_NAME_MAX];
+    ICCatalog  menu_cat;            // built at Tab, reused while it re-filters
+    int        menu_hits[IC_MENU_MAX_HITS];
+    int        menu_n;
+    // The page: entries menu_first .. +menu_per, as many as there is room for;
+    // the digits 1-9 label the nine from menu_num on (Tab moves them). The
+    // grid's columns, and where it goes (at = false: wherever the overlay finds
+    // room). Re-laid out when the page or its anchor changed (icc_menu_layout).
+    int        menu_first, menu_per, menu_num, menu_cols;
+    int        menu_len[IC_MENU_MAX_HITS + 1];
+    bool       menu_at, menu_dirty;
+    float      menu_at_x, menu_at_y;
+    float      menu_lay_ax, menu_lay_ay;
+    char       menu_text[IC_OV_TEXT_MAX];     // one row
+    char       menu_col[IC_OV_TEXT_MAX];      // the grid, '\n' between rows
+    // The buttons inside each of the two texts: where it sits in the string
+    // and on the label, and which entry of the page it picks (-1 = "..more",
+    // which turns the page).
+    ICMenuSeg  menu_seg[2][IC_MENU_SEG_MAX];
+    int        menu_nseg[2];
+    // What was drawn last frame, in screen cells: a press landing there keeps
+    // the menu open for the button to take it.
+    ICMenuBtn  menu_btn[IC_MENU_SEG_MAX];
+    int        menu_nbtn;
+} ICComplete;
 
 // ===========================================================================
 // InteractiveCoding -- the editor host
@@ -302,20 +543,39 @@ struct InteractiveCoding {
     // measures the old wrap.
     int           ins_place_todo;
 
-    // Cells already claimed by a label this frame. First-draw-wins, so a second
-    // label overlapping a first disappears into it rather than blending.
-    ICInspectRect ins_drawn[3 * IC_INSPECT_MAX_SITES];
-    int           ins_num_drawn;
+    // The label layer: placement, claims and painting for every overlay.
+    ICOverlay     ov;
 
-    // This frame's labels, placed and claimed but not yet painted, so two that
-    // ended up touching can still be pulled apart. r0 .. r0+rows-1 are its rows
-    // in ins_drawn; ay1 the row its expression ends on.
-    ICInspectPlaced ins_placed[IC_INSPECT_MAX_SITES];
-    int             ins_num_placed;
+    // ---- Completion and argument help ----
+    ICComplete    cp;
+
+    // What the last refresh asked about, kept for formatting a pass that
+    // arrives later (host mode): whether there is a hover reading, whether it
+    // is a parameter list's signatures, and its source text.
+    bool          ins_have_hover;
+    bool          ins_hover_sig;
+    char          ins_hover_span[512];
+
+    // ---- Host-run mode (interactive_coding_set_run_mode) ----
+    ICRunMode     run_mode;
+    bool          local_check;
+    // The probe set last published, and its serial.
+    ICProbe       ins_probes[IC_INSPECT_MAX_SITES];
+    int           ins_num_probes;
+    unsigned int  ins_probe_serial;
+    // The inspect_begin..end pass in flight was accepted.
+    bool          ins_pass_ok;
+    // The host_begin..end block in flight: accepted, and for which editor.
+    ICEditor     *host_ed;
+    bool          host_ok;
 
     // ---- Code-changed callback (see interactive_coding.h) ----
     InteractiveCodingCodeChangedFn on_code_changed;
     void                          *on_code_changed_user;
+    InteractiveCodingCodeChanged2Fn on_code_changed2;
+    void                           *on_code_changed2_user;
+    InteractiveCodingProbesChangedFn on_probes_changed;
+    void                            *on_probes_changed_user;
 
     // ---- VM-setup callback (see interactive_coding.h) ----
     InteractiveCodingVmSetupFn     on_vm_setup;
@@ -360,6 +620,17 @@ void ic_update_scrubber(InteractiveCoding *ic, UIContext *ui);
 // Draw the inspection labels, re-running the private instrumented compile first
 // when an input changed. Same place and same reason as ic_update_scrubber: a
 // label drawn after the textarea loses every one of its cells to it.
+void ic_update_overlay(InteractiveCoding *ic, UIContext *ui);
+
+// The names a script can use at a point, from the VM (built-ins and everything
+// the host's on_vm_setup registers) and from the buffer's last good parse.
+void ic_catalog_build(InteractiveCoding *ic, ICEditor *ed, ICCatalog *out);
+void ic_catalog_free(InteractiveCoding *ic, ICCatalog *c);
+// Candidates for the word `q`, best first, written to hits[] as indices into
+// the catalog. The word itself is not a candidate.
+int  ic_catalog_query(const ICCatalog *c, const char *q, int qlen, int caret_row,
+                      int *hits, int max_hits);
+const ICName *ic_catalog_find(const ICCatalog *c, const char *name, int caret_row);
 void ic_update_inspect(InteractiveCoding *ic, UIContext *ui);
 // Whether inspection is running: the user's box AND the host's say-so.
 static inline bool ic_inspect_on(const InteractiveCoding *ic) {

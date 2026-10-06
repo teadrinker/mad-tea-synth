@@ -756,6 +756,7 @@ static void song_visual_layer_update_proc(Layer *layer, GContext *ctx) {
   surf.clip_y = 0;
   surf.clip_w = fb_bounds.size.w;
   surf.clip_h = fb_bounds.size.h;
+  surf.layout = 0;
   render_ctx_bind_screen(&s_vscreen_ctx, &surf);
   // Scripts index `screen[x + y*width]`, assuming packed rows; a padded bitmap
   // shears the picture (still in bounds) and is logged once.

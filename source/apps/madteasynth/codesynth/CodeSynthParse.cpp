@@ -40,7 +40,8 @@ enum : int {
   TOK_PUSH_TARGET,
   TOK_POP_TARGET,
   TOK_IMAGE_SAMPLE,
-  TOK_RGB,
+  TOK_RGB,              // retired: rgb() is a vm_lib.h built-in now
+  TOK_COLOR_RAMP_SETUP,
 };
 
 // `width`/`height`/`stride` as folded constants, on every VM since `common` is
@@ -75,12 +76,10 @@ void CodeSynthRegisterScreenBuffers(VM* vm)
   vm_declare_host_buffer(vm, kCodeSynthHostBufPalette, "palette", paletteType,
                          "vscreen_palette", "VSCREEN_PALETTE_LEN");
 
-  // rgb(r,g,b): raw ints. Belongs to `palette`, so it is on audio VMs too; not
-  // ctx-registered.
-  register_c_func_3arg(vm, TOK_RGB, "rgb",
-      NULL, NULL, NULL, NULL,
-      "vscreen_rgb_i32", vscreen_rgb_i32,
-      NULL, NULL, 0);
+  // The microw8 memory map, for the CurlyWas export: the 320x240 framebuffer at
+  // 0x78 and the 256-entry palette at 0x13000, both owned by the platform.
+  vm_place_host_buffer(vm, kCodeSynthHostBufScreen, 0x78, 320 * 240);
+  vm_place_host_buffer(vm, kCodeSynthHostBufPalette, 0x13000, VSCREEN_PALETTE_LEN);
 }
 
 void CodeSynthBindScreenBuffers(VM* vm, RenderCtx* screen, bool bind)
@@ -110,6 +109,7 @@ void CodeSynthRegisterSmp(VM* vm, RenderCtx* screen)
       NULL,       NULL,
       "smp_fx22", smp_fx22,
       22);
+  register_c_func_param_names(vm, TOK_SMP, "rate, filter");
 }
 
 void CodeSynthRegisterCFuncs(VM* vm, RenderCtx* screen)
@@ -127,11 +127,15 @@ void CodeSynthRegisterCFuncs(VM* vm, RenderCtx* screen)
       NULL, NULL, NULL, NULL,
       "vscreen_putpixel_i32", vscreen_putpixel_i32_ctx,
       NULL, NULL, 0);
+  register_c_func_param_names(vm, TOK_PUTPIXEL, "x, y, color");
+  register_c_func_no_value(vm, TOK_PUTPIXEL);
 
   register_c_func_4arg_ctx(vm, TOK_POINT, "point",
       NULL, NULL, NULL, NULL, NULL, NULL,
       "vscreen_point_fx16", vscreen_point_fx16_ctx,
       FX16_SHIFT);
+  register_c_func_param_names(vm, TOK_POINT, "x, y, amount, blend");
+  register_c_func_no_value(vm, TOK_POINT);
 
   // alpha is literal coverage (0 draws nothing), so an omitted alpha defaults to
   // 1.0. The index is 0-based over script-visible params.
@@ -141,6 +145,8 @@ void CodeSynthRegisterCFuncs(VM* vm, RenderCtx* screen)
       NULL, NULL, NULL, NULL, NULL, NULL,
       "vscreen_line_fx16", vscreen_line_fx16_ctx,
       FX16_SHIFT);
+  register_c_func_param_names(vm, TOK_LINE, "x1, y1, x2, y2, stroke_width, alpha, blend");
+  register_c_func_no_value(vm, TOK_LINE);
   register_c_func_defaults(vm, TOK_LINE, 2);
   register_c_func_default_one(vm, TOK_LINE, 5);
 
@@ -149,6 +155,8 @@ void CodeSynthRegisterCFuncs(VM* vm, RenderCtx* screen)
       NULL, NULL, NULL, NULL, NULL, NULL,
       "vscreen_ellipse_fx16", vscreen_ellipse_fx16_ctx,
       FX16_SHIFT);
+  register_c_func_param_names(vm, TOK_ELLIPSE, "x, y, radius_w, radius_h, alpha, blend");
+  register_c_func_no_value(vm, TOK_ELLIPSE);
   register_c_func_defaults(vm, TOK_ELLIPSE, 2);
   register_c_func_default_one(vm, TOK_ELLIPSE, 4);
 
@@ -157,6 +165,8 @@ void CodeSynthRegisterCFuncs(VM* vm, RenderCtx* screen)
       NULL, NULL, NULL, NULL, NULL, NULL,
       "vscreen_circle_fx16", vscreen_circle_fx16_ctx,
       FX16_SHIFT);
+  register_c_func_param_names(vm, TOK_CIRCLE, "x, y, radius, alpha, blend");
+  register_c_func_no_value(vm, TOK_CIRCLE);
   register_c_func_defaults(vm, TOK_CIRCLE, 2);
   register_c_func_default_one(vm, TOK_CIRCLE, 3);
 
@@ -165,6 +175,8 @@ void CodeSynthRegisterCFuncs(VM* vm, RenderCtx* screen)
       NULL, NULL, NULL, NULL, NULL, NULL,
       "vscreen_rect_fx16", vscreen_rect_fx16_ctx,
       FX16_SHIFT);
+  register_c_func_param_names(vm, TOK_RECT, "x, y, w, h, color, alpha, blend");
+  register_c_func_no_value(vm, TOK_RECT);
   register_c_func_defaults(vm, TOK_RECT, 2);
   register_c_func_default_one(vm, TOK_RECT, 5);
 
@@ -173,6 +185,8 @@ void CodeSynthRegisterCFuncs(VM* vm, RenderCtx* screen)
       NULL, NULL, NULL, NULL, NULL, NULL,
       "vscreen_background_fx16", vscreen_background_fx16_ctx,
       FX16_SHIFT);
+  register_c_func_param_names(vm, TOK_BACKGROUND, "color, transparency");
+  register_c_func_no_value(vm, TOK_BACKGROUND);
   register_c_func_defaults(vm, TOK_BACKGROUND, 1);
 
   // glyph(x,y,size,stroke_width,ascii[,alpha,blend])
@@ -180,6 +194,8 @@ void CodeSynthRegisterCFuncs(VM* vm, RenderCtx* screen)
       NULL, NULL, NULL, NULL, NULL, NULL,
       "vscreen_glyph_fx16", vscreen_glyph_fx16_ctx,
       FX16_SHIFT);
+  register_c_func_param_names(vm, TOK_GLYPH, "x, y, size, stroke_width, ascii, alpha, blend");
+  register_c_func_no_value(vm, TOK_GLYPH);
   register_c_func_defaults(vm, TOK_GLYPH, 2);
   register_c_func_default_one(vm, TOK_GLYPH, 5);
 
@@ -194,6 +210,8 @@ void CodeSynthRegisterCFuncs(VM* vm, RenderCtx* screen)
     register_c_func_arg_bytes(vm, TOK_TEXT, 4);
     register_c_func_defaults(vm, TOK_TEXT, 4);
     register_c_func_default_one(vm, TOK_TEXT, 5);
+    register_c_func_param_names(vm, TOK_TEXT,
+        "x, y, size, stroke_width, str, alpha, blend, letter_spacing, line_height");
   }
 
   // font(id), raw int.
@@ -201,12 +219,16 @@ void CodeSynthRegisterCFuncs(VM* vm, RenderCtx* screen)
       NULL, NULL, NULL, NULL,
       "vscreen_font_i32", vscreen_font_i32_ctx,
       NULL, NULL, 0);
+  register_c_func_param_names(vm, TOK_FONT, "id");
+  register_c_func_no_value(vm, TOK_FONT);
 
   // text_align(id), raw int.
   register_c_func_1arg_ctx(vm, TOK_TEXT_ALIGN, "text_align",
       NULL, NULL, NULL, NULL,
       "vscreen_text_align_i32", vscreen_text_align_i32_ctx,
       NULL, NULL, 0);
+  register_c_func_param_names(vm, TOK_TEXT_ALIGN, "id");
+  register_c_func_no_value(vm, TOK_TEXT_ALIGN);
 
   // Off-screen images: image_alloc(w,h), image_getpixel(id,x,y), push_target(id),
   // pop_target(). Raw ints.
@@ -214,29 +236,43 @@ void CodeSynthRegisterCFuncs(VM* vm, RenderCtx* screen)
       NULL, NULL, NULL, NULL,
       "vscreen_image_alloc_i32", vscreen_image_alloc_i32_ctx,
       NULL, NULL, 0);
+  register_c_func_param_names(vm, TOK_IMAGE_ALLOC, "w, h");
 
   register_c_func_3arg_ctx(vm, TOK_IMAGE_GETPIXEL, "image_getpixel",
       NULL, NULL, NULL, NULL,
       "vscreen_image_getpixel_i32", vscreen_image_getpixel_i32_ctx,
       NULL, NULL, 0);
+  register_c_func_param_names(vm, TOK_IMAGE_GETPIXEL, "image_id, x, y");
 
   // image_sample(id,x,y): bilinear, so fx16; `id` is shifted back down.
   register_c_func_3arg_ctx(vm, TOK_IMAGE_SAMPLE, "image_sample",
       NULL, NULL, NULL, NULL, NULL, NULL,
       "vscreen_image_sample_fx16", vscreen_image_sample_fx16_ctx,
       FX16_SHIFT);
+  register_c_func_param_names(vm, TOK_IMAGE_SAMPLE, "image_id, x, y");
 
   register_c_func_1arg_ctx(vm, TOK_PUSH_TARGET, "push_target",
       NULL, NULL, NULL, NULL,
       "vscreen_push_target_i32", vscreen_push_target_i32_ctx,
       NULL, NULL, 0);
+  register_c_func_param_names(vm, TOK_PUSH_TARGET, "image_id");
 
   // No zero-arg registration: one arg, defaulted.
   register_c_func_1arg_ctx(vm, TOK_POP_TARGET, "pop_target",
       NULL, NULL, NULL, NULL,
       "vscreen_pop_target_i32", vscreen_pop_target_i32_ctx,
       NULL, NULL, 0);
+  register_c_func_param_names(vm, TOK_POP_TARGET, "");
+  register_c_func_no_value(vm, TOK_POP_TARGET);
   register_c_func_defaults(vm, TOK_POP_TARGET, 1);
+
+  // color_ramp_setup(add,bit_offset,low[,mid,high]), raw ints.
+  register_c_func_5arg_ctx(vm, TOK_COLOR_RAMP_SETUP, "color_ramp_setup",
+      NULL, NULL, NULL, NULL,
+      "vscreen_color_ramp_setup_i32", vscreen_color_ramp_setup_i32_ctx,
+      NULL, NULL, 0);
+  register_c_func_param_names(vm, TOK_COLOR_RAMP_SETUP, "add, bit_offset, low, mid, high");
+  register_c_func_defaults(vm, TOK_COLOR_RAMP_SETUP, 2);
 
   CodeSynthRegisterSmp(vm, screen);
 }
@@ -613,11 +649,48 @@ Func* FindWrappedVoiceFn(VM* vm)
   return nullptr;
 }
 
+// Probes are spans of the editor's text; the body compiled is found inside it
+// (it may have been trimmed, or lost a WAV directive), and `bodyOff` is where
+// it starts in `src`. A span outside the body names nothing.
+void ApplyProbes(VM* vm, const ParseResult& res, const std::string& src, size_t bodyOff,
+                 const std::string& body, const std::string& commonBody, const CodeSynthProbes* probes)
+{
+  if (!probes || probes->probes.empty()) return;
+
+  // A prelude editor's text sits inside the common+globals text that opens `src`.
+  size_t k, len, off;
+  if (probes->inPrelude)
+  {
+    size_t at = commonBody.rfind(probes->editorBody);
+    if (probes->editorBody.empty() || at == std::string::npos) return;
+    k = 0; len = probes->editorBody.size(); off = at;
+  }
+  else
+  {
+    k = probes->editorBody.find(body);
+    if (k == std::string::npos) return;
+    len = body.size(); off = bodyOff;
+  }
+  VMProbe vp[VM_MAX_PROBES];
+  int n = 0;
+  for (const CodeSynthProbe& p : probes->probes)
+  {
+    if (p.lo < k || p.hi > k + len || p.hi <= p.lo || n >= VM_MAX_PROBES) continue;
+    ASTNode* node = vm_probe_node_for_span(&res, src.c_str(), src.size(), off + p.lo - k, off + p.hi - k);
+    if (!node) continue;
+    vp[n].node = node;
+    vp[n].id = p.id;
+    n++;
+  }
+  vm_set_inspect_probes(vm, vp, n);
+}
+
 // `registerPutpixel` is false for the audio body, which keeps graphics off the
 // audio thread.
 Func* CompileVoiceFn(const char* wrapParams, const std::string& body, const std::string& commonBody,
                       bool registerPutpixel, const cCodeSynthGlobals* globals, RenderCtx* screen,
-                      VM** outVm, Parser** outParser, std::string& err)
+                      VM** outVm, Parser** outParser, std::string& err,
+                      const CodeSynthProbes* probes = nullptr)
 {
   *outVm = nullptr;
   *outParser = nullptr;
@@ -628,6 +701,8 @@ Func* CompileVoiceFn(const char* wrapParams, const std::string& body, const std:
     err = "failed to wrap function body";
     return nullptr;
   }
+  // Newline and '}' follow the body in the wrap.
+  size_t bodyOff = strlen(wrapped) - body.size() - 2 + (commonBody.empty() ? 0 : commonBody.size() + 1);
   std::string src = PrependCommon(commonBody, wrapped);
   g_sys.free(wrapped);
 
@@ -652,6 +727,7 @@ Func* CompileVoiceFn(const char* wrapParams, const std::string& body, const std:
   else                  CodeSynthRegisterSmp(vm, screen);
   // Before the body compiles, or an assignment to a shared variable declares a local.
   if (globals) globals->BindTo(vm);
+  ApplyProbes(vm, res, src, bodyOff, body, commonBody, probes);
   Func* main_f = func_create(vm, res.code_tree, &res);
   if (!main_f)
   {
@@ -888,7 +964,8 @@ static void DiagnoseCommonBlock(const std::string& commonBody,
   parser_deinit(parser); delete parser;
 }
 
-bool CodeSynthParse(const char* specification, const char* workingDirectoryPath, cCodeSynthReadonly* dest, int debugMessagesMaxSize, const char* debugMessages, RenderCtx* screen, bool forVisual)
+bool CodeSynthParse(const char* specification, const char* workingDirectoryPath, cCodeSynthReadonly* dest, int debugMessagesMaxSize, const char* debugMessages, RenderCtx* screen, bool forVisual,
+                    const CodeSynthProbes* probes)
 {
   (void)workingDirectoryPath;
 
@@ -976,7 +1053,10 @@ bool CodeSynthParse(const char* specification, const char* workingDirectoryPath,
     VM* vm = nullptr;
     Parser* parser = nullptr;
     std::string cerr;
-    Func* voiceFn = CompileVoiceFn(wrapParams, cleanBody, commonBody, forVisual, &dest->globals, screen, &vm, &parser, cerr);
+    const CodeSynthProbes* entryProbes = probes && probes->entryName == name ? probes : nullptr;
+    Func* voiceFn = CompileVoiceFn(wrapParams, cleanBody, commonBody, forVisual, &dest->globals, screen, &vm, &parser, cerr,
+                                   entryProbes);
+    if (voiceFn && entryProbes) dest->probeSerial = entryProbes->serial;
     if (!voiceFn)
     {
       // Doesn't compile (often mid-edit): fall back to a silent stub so the note stays
@@ -1123,6 +1203,7 @@ void cCodeSynthGlobals::Reset()
   if (mParser) { parser_deinit(mParser); delete mParser; mParser = nullptr; }
   mInit = nullptr;
   block.clear();
+  initBlock.clear();
   table = VMGlobalTable{};
   valid = false;
   error.clear();
@@ -1218,10 +1299,24 @@ bool cCodeSynthGlobals::FinishBuild(Func* init, ParseResult& res)
   vm_set_globals(mVm, block.data(), block.size(), table.hash);
 
   ResetValues();
+  initBlock = block;
 
   free_parse_result(mParser, &res);
   valid = true;
   return true;
+}
+
+void cCodeSynthGlobals::TakeValuesFrom(const cCodeSynthGlobals& prev)
+{
+  if (block.empty() || prev.block.empty()) return;
+  vm_globals_migrate(&g_sys, &prev.table, prev.block.data(), prev.initBlock.data(),
+                     &table, block.data(), initBlock.data());
+}
+
+void cCodeSynthGlobals::RestoreInitValues()
+{
+  if (!block.empty() && initBlock.size() == block.size())
+    std::copy(initBlock.begin(), initBlock.end(), block.begin());
 }
 
 void cCodeSynthGlobals::ResetValues()
@@ -1256,6 +1351,14 @@ std::string cCodeSynthGlobals::EmitC(const char* typeName, const char* varName) 
   std::string out(c);
   mVm->run.sys->free(c);
   return out;
+}
+
+Func* CodeSynthCompileProbed(const std::string& body, CodeSynthType type, const std::string& prelude,
+                             bool forVisual, const cCodeSynthGlobals* globals, RenderCtx* screen,
+                             const CodeSynthProbes& probes, VM** outVm, Parser** outParser, std::string& err)
+{
+  return CompileVoiceFn(CodeSynthWrapParamsForType(type), body, prelude, forVisual, globals, screen,
+                        outVm, outParser, err, &probes);
 }
 
 void CodeSynthReleaseExport(VM* vm, Parser* parser, ParseResult* res)

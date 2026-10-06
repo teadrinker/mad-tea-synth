@@ -118,13 +118,13 @@ void SteepSynth::OnIdle()
 // v3:  export page (folder, name, author, target, w, h, filter, rate)
 // v4:  line height     v5: preview position   v6: exAlignBpm      v7: exUuid, length-prefixed
 // v8:  previewEnabled  v9: exWavRemoveSrc     v10: uiScaleAuto    v11: clipOutput
-// v12: exSndLoopShape
+// v12: exSndLoopShape  v13: screenZoom
 //
 // New fields go at the end, in a new version-gated block. uiScale and
 // scrollCount are unversioned, so they are doubles: the VST3 wrapper reads a
 // 4-byte bypass flag right after this chunk, which an 8-byte field can't be
 // mistaken for.
-static const int kStateVersion = 12;
+static const int kStateVersion = 13;
 
 bool SteepSynth::SerializeState(IByteChunk& chunk) const
 {
@@ -256,6 +256,10 @@ bool SteepSynth::SerializeState(IByteChunk& chunk) const
   int32_t exSndLoopShape = (int32_t)mExportSettings.sndLoopShape;
   chunk.Put(&exSndLoopShape);
 
+  // v13: preview zoom.
+  double screenZoom = (double)ui.screenZoom;
+  chunk.Put(&screenZoom);
+
   return true;
 }
 
@@ -376,6 +380,7 @@ int SteepSynth::UnserializeState(const IByteChunk& chunk, int startPos)
     mEngine.SetFileIsMaster(fileIsMaster != 0);
     // Unconditional, so a saved-empty project doesn't come back with the Example entry.
     mEngine.CodeSynthSetSourceText(code.data(), code.size());
+    mEngine.ResetCodeSynthGlobals();
     mUiStateRevision++; // the editor has to re-read the entry list it just got
   }
 
@@ -540,6 +545,16 @@ int SteepSynth::UnserializeState(const IByteChunk& chunk, int startPos)
     pos = next;
     if (exSndLoopShape >= 0 && exSndLoopShape <= kSongSndLoopPerSample)
       mExportSettings.sndLoopShape = (unsigned)exSndLoopShape;
+  }
+
+  // v13. Absent means the default zoom.
+  if (ver >= 13)
+  {
+    double screenZoom = kScreenZoom;
+    if ((next = chunk.Get(&screenZoom, pos)) < 0) return pos;
+    pos = next;
+    mUiState.screenZoom = (float)(screenZoom < kScreenZoomMin ? kScreenZoomMin : (screenZoom > kScreenZoomMax ? kScreenZoomMax : screenZoom));
+    mUiStateRevision++;
   }
 
   return pos;

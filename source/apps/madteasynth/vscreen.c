@@ -23,6 +23,9 @@ static RenderImage s_images[VSCREEN_MAX_IMAGES];
 static RSurface    s_target_stack[VSCREEN_TARGET_STACK_MAX];
 static int         s_target_flags[VSCREEN_TARGET_STACK_MAX];
 
+// Zero: built as the GColor8 default on the first draw.
+static RLayout s_layout;
+
 static const FONT_LOWSPEC *vscreen_font_resolve(void *user, int id);
 
 // This context's glyph cache, reached through font_resolve_user since drawing fills it.
@@ -35,7 +38,7 @@ static VScreenFontCache s_font_cache;
 
 // Everything a link-time constant: there is no init hook.
 static RenderCtx s_ctx = {
-    .screen = { VSCREEN_PIXELS, VSCREEN_W, 0, 0, VSCREEN_W, VSCREEN_H },
+    .screen = { VSCREEN_PIXELS, VSCREEN_W, 0, 0, VSCREEN_W, VSCREEN_H, &s_layout },
     .generation = 1,
 
     .scratch     = s_glyph_scratch,
@@ -58,6 +61,8 @@ static RenderCtx s_ctx = {
     // The global the exported song.c names; other hosts provision their own.
     .palette     = vscreen_palette,
     .palette_len = VSCREEN_PALETTE_LEN,
+
+    .layout = &s_layout,
 };
 
 // Exposed so a VM can get it as user_data.
@@ -201,6 +206,7 @@ static const FONT_LOWSPEC *vscreen_font_resolve(void *user, int id)
 void vscreen_ctx_provision(RenderCtx *c,
                            unsigned char *pixels, int w, int h,
                            int *palette, int palette_len,
+                           RLayout *layout,
                            char *scratch, int scratch_bytes,
                            char *image_arena, int image_arena_bytes,
                            RenderImage *images, int image_cap,
@@ -225,6 +231,13 @@ void vscreen_ctx_provision(RenderCtx *c,
     c->screen.clip_w = w;
     c->screen.clip_h = h;
     c->generation    = 1;
+
+    if (layout) {
+        layout->key     = 0;
+        layout->bits[0] = 0;
+    }
+    c->layout        = layout;
+    c->screen.layout = layout;
 
     c->scratch     = scratch;
     c->scratch_end = scratch ? scratch + scratch_bytes : 0;
@@ -292,6 +305,9 @@ void vscreen_text(int x, int y, int size, int stroke_width,
                   letter_spacing, line_height); }
 
 int vscreen_font_i32(int id)       { return render_ctx_font_i32(&s_ctx, id); }
+
+int vscreen_color_ramp_setup_i32(int add, int bit_offset, int low, int mid, int high)
+{ return render_ctx_color_ramp_setup_i32(&s_ctx, add, bit_offset, low, mid, high); }
 int vscreen_text_align_i32(int id) { return render_ctx_text_align_i32(&s_ctx, id); }
 
 int vscreen_image_alloc_i32(int w, int h)

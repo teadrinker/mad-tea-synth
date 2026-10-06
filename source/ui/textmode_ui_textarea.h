@@ -99,6 +99,12 @@ void  ui_textarea_set_text(UITextArea *ta, const char *text, bool clear_history)
 char *ui_textarea_get_text(UITextArea *ta);
 
 // ===== Options =====
+// A single-line field: Enter releases keyboard focus (ui->focus_id becomes
+// UI_FOCUS_RELEASED) instead of inserting a line, and pasted newlines are
+// dropped. ui_textarea_int / ui_textarea_str (and the _absolute_pos forms) turn
+// it on by themselves; a plain one-row ui_textarea needs this call.
+void ui_textarea_set_single_line(UITextArea *ta, bool single_line);
+
 void ui_textarea_set_show_line_numbers(UITextArea *ta, bool show);
 void ui_textarea_set_show_bottom_status(UITextArea *ta, bool show);
 void ui_textarea_set_enable_fractional_scroll(UITextArea *ta, bool enable);
@@ -174,6 +180,20 @@ void ui_textarea_undo_end_batch(UITextArea *ta);
 // handling aborts it). No-op if an undo went below the mark meanwhile.
 int  ui_textarea_undo_mark(UITextArea *ta);
 void ui_textarea_undo_merge_since(UITextArea *ta, int mark);
+
+// ===== Find =====
+// Ctrl+F opens a one-row dialog in the top right corner of any multi-line
+// textarea: query field, "x of n", previous / next / close. Matches are
+// ASCII case-insensitive, drawn green in the text and as ticks on the
+// scrollbar. Enter / Shift+Enter (or F3 / Shift+F3) step through the matches
+// and select the current one; Escape closes. This opens the dialog from code
+// too, seeding the query from a single-line selection.
+void ui_textarea_find_open(UITextArea *ta);
+
+// True while the textarea holds keyboard focus, which includes its find dialog's
+// query field. Compare ui->focus_id against ui_id_from_ptr(ta) and a host that
+// forwards keys only to a focused editor stops hearing the query being typed.
+bool ui_textarea_has_focus(UIContext *ui, UITextArea *ta);
 
 // ===== Programmatic editing primitives =====
 // These fire callbacks (on_insert_text, on_delete_text, on_delete_line,

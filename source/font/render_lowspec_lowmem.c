@@ -180,7 +180,11 @@ static long long poly_fx16_slope(long long dx, long long dy) {
 // GColor8 bytes, not plain 8-bit grayscale (which would need a caller-side
 // quantizing blit). Also covers the RG_FLAGS_RENDER_LINE_OUTLINE aaline path --
 // one define, one pixel format for the whole TU (common/render_surface.h).
+// microw8 shares this sizing but builds with -DRS_PEBBLE_TIME2=0 for runtime
+// layouts (common/render_layout.h).
+#ifndef RS_PEBBLE_TIME2
 #define RS_PEBBLE_TIME2     1
+#endif
 
 // Glyph raster cache: the tile a cache entry is rasterized into comes off the
 // front of s_glyph_scratch, so it has to be paid for there or the render

@@ -122,4 +122,14 @@ int ui_glue_draw_grade_lineh(UIContext *ui, float *line_height,
 #define UI_GLUE_TEXT_INTENSITY_MAX   (255.0f / 255.0f)
 int ui_glue_draw_theme(UIContext *ui);
 
+// A "Theme" dropdown panel holding the Grade/LineH/Black/Text sliders in one
+// column -- the same controls as ui_glue_draw_grade_lineh and
+// ui_glue_draw_theme, out of the header row. Zoom stays outside: Auto has to be drawn every frame to follow
+// the display. With a non-NULL font_index a Font option bar sits on top; the
+// caller reloads its font when the index moves. Reset puts everything back to
+// the defaults (font 0, LineH at lineh_middle). Returns nonzero if anything changed this frame.
+int ui_glue_draw_view_panel(UIContext *ui, float *line_height,
+                            float lineh_min, float lineh_middle, float lineh_max,
+                            int *font_index, const char *const font_names[], int font_count);
+
 #endif // UI_GLUE_H

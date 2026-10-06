@@ -26,11 +26,9 @@ set "PROJECT_NAME={{SLUG}}"
 set "OUT=%PROJECT_NAME%.exe"
 set "SRC=src/c/main.c src/c/vscreen.c src/c/song/song.c src/c/common/math_fixedp.c src/c/common/math_pure.c src/c/font/render_lowspec.c src/c/font/render_ctx.c"
 
-:: RS_PEBBLE_TIME2=1 makes render_lowspec's aaline blend in GColor8 space, which
-:: is the pixel format vscreen uses -- the framebuffer is one 0bAARRGGBB byte per
-:: pixel, exactly like a Pebble Time 2 panel. Without it the anti-aliased edges
-:: blend as 8-bit gray and every fringe is wrong.
-set "DEFS=-DRS_PEBBLE_TIME2=1"
+:: No RS_PEBBLE_TIME2: render_lowspec blends through the screen's runtime layout
+:: (GColor8 0bAARRGGBB until the song calls color_ramp_setup).
+set "DEFS="
 rem -include song_config.h on EVERY translation unit, not just the ones that
 rem name it. vscreen.c only includes vscreen.h, so without this it would compile
 rem against the DEFAULT VSCREEN_W/H and arena sizes while main.c compiled against

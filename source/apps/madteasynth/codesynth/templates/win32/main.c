@@ -176,6 +176,35 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     return DefWindowProcA(h, m, w, l);
 }
 
+static int has_arg(const char *name)
+{
+    for (const char *p = GetCommandLineA(); *p; p++)
+    {
+        const char *a = p, *b = name;
+        while (*a && *a == *b) { a++; b++; }
+        if (!*b) return 1;
+    }
+    return 0;
+}
+
+// Largest whole-number scale that fits, centred; the rest stays black.
+static void present(void)
+{
+    RECT c;
+    GetClientRect(g_hwnd, &c);
+    int s = c.right / VSCREEN_W;
+    int sy = c.bottom / VSCREEN_H;
+    if (sy < s) s = sy;
+    if (s < 1) s = 1;
+    int w = VSCREEN_W * s, h = VSCREEN_H * s;
+    int x = (c.right - w) / 2, y = (c.bottom - h) / 2;
+
+    HDC dc = GetDC(g_hwnd);
+    if (s == 1) BitBlt(dc, x, y, w, h, g_memdc, 0, 0, SRCCOPY);
+    else        StretchBlt(dc, x, y, w, h, g_memdc, 0, 0, VSCREEN_W, VSCREEN_H, SRCCOPY);
+    ReleaseDC(g_hwnd, dc);
+}
+
 // Plain main(): the tiny build reaches it via crt_stub_win32.c's mainCRTStartup.
 int main(void)
 {
@@ -186,16 +215,27 @@ int main(void)
     wc.lpfnWndProc   = wndproc;
     wc.hInstance     = inst;
     wc.hCursor       = LoadCursor(0, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     wc.lpszClassName = "codesynth_song";
     RegisterClassA(&wc);
 
-    // Client area = framebuffer, so the blit is 1:1.
-    RECT r = { 0, 0, VSCREEN_W, VSCREEN_H };
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, 0);
-    g_hwnd = CreateWindowA("codesynth_song", SONG_WINDOW_TITLE,
-                           WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                           CW_USEDEFAULT, CW_USEDEFAULT,
-                           r.right - r.left, r.bottom - r.top, 0, 0, inst, 0);
+    if (has_arg("-windowed"))
+    {
+        // Client area = framebuffer, so the blit is 1:1.
+        RECT r = { 0, 0, VSCREEN_W, VSCREEN_H };
+        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, 0);
+        g_hwnd = CreateWindowA("codesynth_song", SONG_WINDOW_TITLE,
+                               WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                               CW_USEDEFAULT, CW_USEDEFAULT,
+                               r.right - r.left, r.bottom - r.top, 0, 0, inst, 0);
+    }
+    else
+    {
+        g_hwnd = CreateWindowA("codesynth_song", SONG_WINDOW_TITLE, WS_POPUP | WS_VISIBLE,
+                               0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN),
+                               0, 0, inst, 0);
+        ShowCursor(0);
+    }
     make_dib();
 
     g_total_samples = song_total_samples();
@@ -232,9 +272,7 @@ int main(void)
             song_visual_render(audio_played_samples(), &g_visual_state);
             vscreen_expand_rgba((unsigned int *)g_bits, VSCREEN_W);
 #endif
-            HDC dc = GetDC(g_hwnd);
-            BitBlt(dc, 0, 0, VSCREEN_W, VSCREEN_H, g_memdc, 0, 0, SRCCOPY);
-            ReleaseDC(g_hwnd, dc);
+            present();
         }
 
         Sleep(1);

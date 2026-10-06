@@ -222,6 +222,18 @@ void  vm_import_globals(VM *vm, const VMGlobalTable *tbl);
 void  vm_set_globals(VM *vm, void *block, size_t size, unsigned long long layout_hash);
 void *vm_get_globals(VM *vm);
 
+// Hot-swap: carries running values from an old block into a new one after the
+// declarations were recompiled. Per variable in `to_tbl`, its bytes are copied
+// when `from_tbl` has the same name with an identical slot (type, shift,
+// struct), it is not a slice, and its initial value is unchanged; anything else
+// keeps what `to_block` holds. `from_init` / `to_init` are each block as it was
+// right after its initialiser ran, so editing an initialiser takes effect; pass
+// both NULL to skip that check. No allocation, no VM: safe on a realtime
+// thread. Returns the number of variables carried.
+int   vm_globals_migrate(Tsys *sys,
+                         const VMGlobalTable *from_tbl, const void *from_block, const void *from_init,
+                         const VMGlobalTable *to_tbl, void *to_block, const void *to_init);
+
 // Prefix for a shared variable's name in emitted C -- typically "<instance>."
 // so `phase` emits as `inst.phase`. Per VM, so two VMs compiled from the
 // same declarations can be pointed at two different C instances without either
@@ -256,6 +268,34 @@ int   vm_declare_const_num(VM *vm, const char *name, double value, int is_int);
 // auto_pack off: packing saves nothing on a GPU and has no type there. 0
 // restores the identity tables and auto_pack.
 void  vm_set_shader_profile(VM *vm, int on);
+
+// ----- Name catalog -----
+// Every name a script can use that the VM itself knows about: natives, library
+// built-ins, host consts and buffers, bound shared variables and intrinsics.
+// What the editor completes from and builds call hints out of, so it need not
+// learn six tables. A name a unit declares for itself is not here -- it is in the
+// source.
+typedef enum {
+    VM_NAME_NATIVE, VM_NAME_LIB, VM_NAME_CONST, VM_NAME_HOST_BUF,
+    VM_NAME_GLOBAL, VM_NAME_INTRINSIC
+} VMNameKind;
+
+// Every pointer is valid only for the duration of the callback.
+typedef struct VMNameInfo {
+    const char *name;
+    VMNameKind  kind;
+    int         n_params;      // -1 = not callable, or a shape with no fixed arity
+    int         n_optional;    // trailing params with defaults
+    const char *params;        // "x0, y0, x1, y1, col" -- or NULL when unknown
+    const char *param_types;   // "f64, f64, ..." -- or NULL when unknown
+    const char *ret_type;      // "void" -- or NULL when unknown
+} VMNameInfo;
+
+typedef void (*VMNameFn)(void *user, const VMNameInfo *info);
+void vm_enumerate_names(VM *vm, VMNameFn fn, void *user);
+
+const char *vm_directive_option_name(int i);
+int         vm_directive_option_default(int i);
 
 // ----- Host buffers -----
 // A named array the HOST owns and the script indexes: `screen[i] = c`,
@@ -295,6 +335,12 @@ void  vm_set_shader_profile(VM *vm, int on);
 // reach a framebuffer through the C export instead.
 int   vm_declare_host_buffer(VM *vm, int id, const char *name, VMType type,
                              const char *c_name, const char *c_len_expr);
+
+// Where a declared buffer sits in a flat linear memory, for the backends that
+// address one directly (vm_emit_curlywas.c): element i is at addr + i * element
+// size, and `.len` is `len`. Without it such a backend has no spelling for the
+// buffer. Re-declaring the id forgets it. Returns 1, or 0 for an undeclared id.
+int   vm_place_host_buffer(VM *vm, int id, int addr, int len);
 
 // Borrowed -- never freed, never copied -- and rebindable at any time. An
 // unbound buffer is {NULL,0}, and any access fails the run with "array index
@@ -512,6 +558,18 @@ void register_c_func_sig_ctx(VM *vm, int tok, const char *script_name,
 // must be trailing.
 void register_c_func_defaults(VM *vm, int tok, int n_defaults);
 
+// The script-visible parameter names of an already-registered native, as they
+// would be written in a signature: "x0, y0, x1, y1, col, alpha". Borrowed -- the
+// string must outlive the VM. For the editor's call hints only (see
+// vm_enumerate_names); a native without names still reports its arity. Call
+// AFTER registering the function.
+void register_c_func_param_names(VM *vm, int tok, const char *names);
+
+// The fixed-arity natives all return a number; this tells the editor that
+// this one's is meaningless, so it completes `circle ` rather than `circle(`.
+// Calls still compile and run exactly as before. Call AFTER registering.
+void register_c_func_no_value(VM *vm, int tok);
+
 // Make ONE of those optional parameters default to 1.0 (an fx16 FX16_ONE
 // constant, rescaled to whatever Q-format the slot wants) instead of 0.
 // `arg_index` is 0-based over the script-visible parameters.
@@ -665,7 +723,32 @@ void vm_set_inspect_sink(VM *vm, VMInspectFn fn, void *user);
 // scalar sink: with none installed an aggregate operand is still evaluated and
 // yielded, and nothing is reported.
 void vm_set_inspect_array_sink(VM *vm, VMInspectArrFn fn, void *user);
+
+// Probes: compile each `node` as if the source said __ins(node, id), leaving
+// the source alone. A host that does not own the text (or must not change it,
+// like the reactive engine, whose edit diff keys on structure) inspects this
+// way. Applies to every later func_create / statement compile on `vm` until
+// changed; n == 0 clears. At most VM_MAX_PROBES; the rest are ignored. Only
+// rvalue compiles are wrapped, and a node compiled twice reports from each.
+void vm_set_inspect_probes(VM *vm, const VMProbe *probes, int n);
 #endif
+
+// The byte span [lo, hi) of `node`'s whole subtree in the text `pr` was parsed
+// from: every offset whose txt_to_ref chain passes through `node`. Needs
+// PARSE_OUTPUT_REFS. 0 when the node owns no text.
+int  vm_subtree_span(const ParseResult *pr, ASTNode *node, size_t text_len,
+                     size_t *out_lo, size_t *out_hi);
+
+// A subtree span as the editor clamps it for inspection: refused when it
+// crosses a line, cut before a comment, trailing blanks trimmed. 0 when
+// nothing is left.
+int  vm_inspect_span_clamp(const char *text, size_t *lo, size_t *hi);
+
+// The node a probe span names in a parse of `text` (PARSE_OUTPUT_REFS): the
+// innermost node on the chain above txt_to_ref[lo] whose subtree span, raw or
+// clamped, is exactly [lo, hi). NULL when none is.
+ASTNode *vm_probe_node_for_span(const ParseResult *pr, const char *text, size_t text_len,
+                                size_t lo, size_t hi);
 
 // What the C / JS / Lua emitters do with a print() call.
 //

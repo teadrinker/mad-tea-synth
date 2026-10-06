@@ -186,6 +186,10 @@ static inline unsigned char cvx_px(const RBlend *b, unsigned int cur, int a, int
     unsigned char out = (unsigned char)(0xC0 | (r << 4) | (g << 2) | u);
     return (unsigned char)((out & b->mask) | ((unsigned char)cur & b->nmask));
 }
+#define CVX_PX(b, cur, a, x, y) cvx_px((b), (cur), (a), RB_LUT_DITHER_AT((x), (y)), cr, cg, cbl)
+#elif RB_LAYOUTS
+// The runtime-layout twin: rb_px_chan is what rb_lut_make_l tabulates.
+#define CVX_PX(b, cur, a, x, y) rb_px_chan((b), (cur), (a))
 #endif
 
 // ===================================================================
@@ -214,13 +218,16 @@ static void convex_fill_aa(const RSurface *surf, const int *pts_xy, int n,
     fixed ytop, ybot;
     int top = 0, bot = 0, i, y, y0, y1;
     int cx0, cx1, cy0, cy1;
-#if RS_PEBBLE_TIME2
+#if RS_PEBBLE_TIME2 || RB_LAYOUTS
     // Everything the Tier B half needs. An 8-bit gray destination reaches none
     // of it -- no table, no per-channel targets -- so it is not merely unused
     // there, it is inapplicable.
     const RBlendLut *lut;
     RBlendCache local;
-    int a8, cr, cg, cbl;
+    int a8;
+#endif
+#if RS_PEBBLE_TIME2
+    int cr, cg, cbl;
 #endif
 
     if (n < 3 || alpha <= 0) return;
@@ -259,16 +266,18 @@ static void convex_fill_aa(const RSurface *surf, const int *pts_xy, int n,
     // the draw's alpha (so the fringe gets alpha folded in for free, exactly as
     // gr_rasterize does); the table carries the core, whose coverage is the
     // constant `alpha` and nothing else.
-    rb = rb_make(blend, -1, alpha);
-#if RS_PEBBLE_TIME2
+    rb = RB_MAKE(surf, blend, -1, alpha);
+#if RS_PEBBLE_TIME2 || RB_LAYOUTS
     if (!bc) { rb_cache_reset(&local); bc = &local; }
     a8  = rb.alpha8;
-    lut = rb_lut_get(bc, blend, -1, a8);
+    lut = RB_LUT_GET(bc, surf, blend, -1, a8);
+#else
+    (void)bc;
+#endif
+#if RS_PEBBLE_TIME2
     cr  = ((rb.col_raw >> 4) & 3) * 85;
     cg  = ((rb.col_raw >> 2) & 3) * 85;
     cbl = ( rb.col_raw       & 3) * 85;
-#else
-    (void)bc;
 #endif
 
     for (y = y0; y < y1; y++) {
@@ -342,25 +351,23 @@ static void convex_fill_aa(const RSurface *surf, const int *pts_xy, int n,
         // Written as three loops rather than one loop with a branch: the core
         // loop is the one that has to stay tight, and hoisting the test out of
         // it is the entire reason for computing core0/core1 above.
-#if RS_PEBBLE_TIME2
+#if RS_PEBBLE_TIME2 || RB_LAYOUTS
         if (lut) {
             for (x = frin0; x < core0; x++) {
                 int acc = 0, cov;
                 for (s = 0; s < S; s++) acc += cvx_span_cov(xl[s], xr[s], x);
                 if (acc <= 0) continue;
                 cov = (acc + S / 2) / S;                    // gr_rasterize's RB_COV8
-                row[x] = cvx_px(&rb, row[x], (a8 == 255) ? cov : (cov * a8) / 255,
-                                RB_LUT_DITHER_AT(x, y), cr, cg, cbl);
+                row[x] = CVX_PX(&rb, row[x], (a8 == 255) ? cov : (cov * a8) / 255, x, y);
             }
             for (x = core0; x < core1; x++)
-                row[x] = lut->t[RB_LUT_PHASE(x, y)][row[x] & 0x3F];
+                row[x] = RB_LUT_AT(lut, x, y, row[x]);
             for (x = core1; x < frin1; x++) {
                 int acc = 0, cov;
                 for (s = 0; s < S; s++) acc += cvx_span_cov(xl[s], xr[s], x);
                 if (acc <= 0) continue;
                 cov = (acc + S / 2) / S;
-                row[x] = cvx_px(&rb, row[x], (a8 == 255) ? cov : (cov * a8) / 255,
-                                RB_LUT_DITHER_AT(x, y), cr, cg, cbl);
+                row[x] = CVX_PX(&rb, row[x], (a8 == 255) ? cov : (cov * a8) / 255, x, y);
             }
             continue;
         }
@@ -378,6 +385,10 @@ static void convex_fill_aa(const RSurface *surf, const int *pts_xy, int n,
                 if (acc <= 0) continue;
                 cov = (acc + S / 2) / S;
             }
+#if RB_LAYOUTS
+            // BLEND_REPLACE has no table either; blend it rather than write gray.
+            if (!rb.gray8) { row[x] = rb_px_ramp(&rb, row[x], cov); continue; }
+#endif
             row[x] = rb_px_gray(&rb, row[x], cov);
         }
     }

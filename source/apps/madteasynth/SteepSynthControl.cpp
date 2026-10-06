@@ -27,6 +27,7 @@ void PlatformClipboard_SetGraphics(IGraphics* graphics);
 extern "C" void PlatformKeyFocus_SetGraphics(void* graphics);
 extern "C" void PlatformKeyFocus_SetEditorFocused(int focused);
 extern "C" int  PlatformKeyFocus_WindowHasOsFocus(void);
+extern "C" void PlatformKeyFocus_SetCaptureEscape(int on);
 
 #include "codesynth/CodeSynthVmCtx.h"
 
@@ -39,6 +40,29 @@ struct CodeSynthPreviewSmp
   CodeSynthVmCtx   ctx{};
   std::string      key;               // dir/path/chain the cached sample came from
   ~CodeSynthPreviewSmp() { if (sample) sample_free(sample); }
+};
+
+// The sound editor's host: the open entry's sound body, compiled with the
+// editor's probes, run on the UI thread with the visual pipeline's last
+// arguments -- the values the editor used to compute privately, without
+// touching the audio thread.
+struct SteepSynthControl::SoundReplay
+{
+  VM*         vm = nullptr;
+  Parser*     parser = nullptr;
+  Func*       fn = nullptr;
+  CodeSynthType type = CodeSynthType();
+  std::string body;
+  unsigned    codeSerial = 0;
+  unsigned    probeSerial = 0;
+  int         entry = -1;
+  std::string print;
+  ~SoundReplay() { Release(); }
+  void Release()
+  {
+    if (vm || parser) CodeSynthReleaseExport(vm, parser, nullptr);
+    vm = nullptr; parser = nullptr; fn = nullptr;
+  }
 };
 
 SteepSynthControl::SteepSynthControl(const IRECT& bounds, SteepSynth* pPlugin)
@@ -100,9 +124,33 @@ SteepSynthControl::SteepSynthControl(const IRECT& bounds, SteepSynth* pPlugin)
               g->BindTo(vm);
         }, ed);
 
-    interactive_coding_set_code_changed_callback(ed->ic, &SteepSynthControl::OnCodeChanged, ed);
+    interactive_coding_set_code_changed_callback2(ed->ic, &SteepSynthControl::OnCodeChanged, ed);
 
     interactive_coding_set_wrap_args_callback(ed->ic, &SteepSynthControl::OnWrapArgs, ed);
+
+    // The engine runs the bodies: the editor compiles each edit for its errors
+    // and is told the results and the readings.
+    interactive_coding_set_run_mode(ed->ic, IC_RUN_HOST);
+    interactive_coding_set_local_check(ed->ic, true);
+    interactive_coding_set_probes_changed_callback(ed->ic, &SteepSynthControl::OnProbesChanged, ed);
+  }
+
+  if (mEngine)
+  {
+    CodeSynthInspectListener l;
+    l.user  = this;
+    l.begin = [](void* u, unsigned serial) {
+      interactive_coding_inspect_begin(static_cast<SteepSynthControl*>(u)->mVisualEd.ic, serial);
+    };
+    l.value = [](void* u, int id, int kind, int shift, double v) {
+      interactive_coding_inspect_value(static_cast<SteepSynthControl*>(u)->mVisualEd.ic, id, kind, shift, v);
+    };
+    l.array = [](void* u, int id, int kind, int shift, int total, const double* vals, int n) {
+      interactive_coding_inspect_array(static_cast<SteepSynthControl*>(u)->mVisualEd.ic, id, kind, shift, total, vals, n);
+    };
+    l.end = [](void* u) { interactive_coding_inspect_end(static_cast<SteepSynthControl*>(u)->mVisualEd.ic); };
+    l.ran = [](void* u, bool ok, const char* print, int n) { static_cast<SteepSynthControl*>(u)->OnVisualRan(ok, print, n); };
+    mEngine->SetCodeSynthInspectListener(l);
   }
 
   // One-row fields: no gutter, no status line.
@@ -119,6 +167,14 @@ SteepSynthControl::~SteepSynthControl()
   // The keyboard hook is thread-scoped and would outlive this control.
   PlatformKeyFocus_SetEditorFocused(0);
   PlatformKeyFocus_SetGraphics(nullptr);
+
+  // The engine outlives this control: nothing may call back into it.
+  if (mEngine)
+  {
+    mEngine->SetCodeSynthInspectListener(CodeSynthInspectListener());
+    mEngine->SetCodeSynthVisualProbes(CodeSynthProbes());
+  }
+  delete mSoundReplay; mSoundReplay = nullptr;
 
   // Editors first: their VMs borrow the globals blocks.
   interactive_coding_destroy(mSoundEd.ic);
@@ -175,7 +231,12 @@ void SteepSynthControl::ReallocBackbuffer()
   mImageValid = false;
 }
 
-void SteepSynthControl::RebuildUI(float /* fps */)
+static float ClampScreenZoom(float z)
+{
+  return z < kScreenZoomMin ? kScreenZoomMin : (z > kScreenZoomMax ? kScreenZoomMax : z);
+}
+
+void SteepSynthControl::RebuildUI(float /* fps */, bool keepFonts)
 {
   // Device pixels; only Auto reads the display scale. Everything that sizes a cell
   // must go through font_size, or grid and glyphs disagree.
@@ -191,12 +252,12 @@ void SteepSynthControl::RebuildUI(float /* fps */)
   if (cell_w < 1) cell_w = 1;
   if (cell_h < 1) cell_h = 1;
 
-  mScreenZoomDev = kScreenZoom < 1 ? 1 : kScreenZoom;
+  mScreenZoomDev = ClampScreenZoom(Ui().screenZoom);
 
   // Per-instance live width. A floating preview reserves no strip.
   const int screenW = vscreen_width_ctx(mPlugin ? mEngine->ScreenCtx() : nullptr);
   mScreenPanelW = Ui().screenDocked
-      ? (float)(screenW * mScreenZoomDev) / mBackScale + kScreenMargin * 2
+      ? std::floor((float)screenW * mScreenZoomDev + 0.5f) / mBackScale + kScreenMargin * 2
       : 0.f;
 
   // Columns from what the screen panel leaves, so the UI never draws under it.
@@ -207,15 +268,18 @@ void SteepSynthControl::RebuildUI(float /* fps */)
   int new_rows = mBackPhysH / cell_h;
   if (new_cols < 8) new_cols = 8;
   if (new_rows < 4) new_rows = 4;
+  int grid_cols = mBackPhysW / cell_w;
+  if (grid_cols < new_cols) grid_cols = new_cols;
 
   mCols = new_cols;
+  mGridCols = grid_cols;
   mRows = new_rows;
   mCellW = (float)cell_w / mBackScale;
   mCellH = (float)cell_h / mBackScale;
 
-  font_cache_clear(mFC);
-  tm_resize(mTM, mCols, mRows, ui_theme_color(mUI, UI_COL_DEFAULT));
-  ui_resize(mUI, mCols, mRows);
+  if (!keepFonts) font_cache_clear(mFC);
+  tm_resize(mTM, mGridCols, mRows, ui_theme_color(mUI, UI_COL_DEFAULT));
+  ui_resize(mUI, mGridCols, mRows);
   ui_set_cell_size(mUI, mCellW, mCellH);
 }
 
@@ -253,10 +317,157 @@ static std::string Trimmed(const std::string& s)
 }
 
 // `body` is the bare entry source, valid only for this call.
-void SteepSynthControl::OnCodeChanged(const char* body, void* user)
+void SteepSynthControl::OnCodeChanged(const char* body, unsigned serial, void* user)
 {
   CodeEditor* ed = static_cast<CodeEditor*>(user);
+  ed->codeSerial = serial;
   ed->owner->PushLiveEdit(body, *ed);
+}
+
+void SteepSynthControl::OnProbesChanged(const ICProbe* probes, int n, unsigned codeSerial,
+                                        unsigned probeSerial, void* user)
+{
+  (void)codeSerial;
+  CodeEditor* ed = static_cast<CodeEditor*>(user);
+  ed->probes.clear();
+  // Signatures are not reported by the engine.
+  for (int i = 0; i < n; i++)
+    if (!probes[i].is_sig) ed->probes.push_back({ probes[i].id, probes[i].lo, probes[i].hi });
+  ed->probeSerial = probeSerial;
+  ed->probesDirty = true;
+}
+
+// The first run of a newly compiled visual pipeline: the visual editor's result
+// line and print log, for the body it was compiled from.
+void SteepSynthControl::OnVisualRan(bool ok, const char* print, int printLen)
+{
+  if (!mVisualEd.ic || mVisualEd.codeSerial == 0) return;
+  interactive_coding_host_begin(mVisualEd.ic, mVisualEd.codeSerial);
+  if (!ok) interactive_coding_host_error(mVisualEd.ic, IC_HOST_RUN, -1, -1, "visual body failed at run time");
+  else     interactive_coding_host_result(mVisualEd.ic, "(visual ran)");
+  if (print && printLen > 0) interactive_coding_host_print(mVisualEd.ic, (const unsigned char*)print, printLen);
+  interactive_coding_host_end(mVisualEd.ic);
+}
+
+static void ReplayInspectSink(void* user, int id, int kind, int shift, double v)
+{
+  if (id >= 0) interactive_coding_inspect_value(static_cast<InteractiveCoding*>(user), id, kind, shift, v);
+}
+static void ReplayInspectArrSink(void* user, int id, int kind, int shift, int total, const double* vals, int n)
+{
+  if (id >= 0) interactive_coding_inspect_array(static_cast<InteractiveCoding*>(user), id, kind, shift, total, vals, n);
+}
+static void ReplayPrintSink(void* user, const unsigned char* s, int n)
+{
+  std::string* out = static_cast<std::string*>(user);
+  if (out->size() + (size_t)n + 1 > 65536) return;
+  out->append(reinterpret_cast<const char*>(s), (size_t)n);
+  out->push_back('\n');
+}
+
+void SteepSynthControl::ReplaySound()
+{
+  CodeEditor& ed = mSoundEd;
+  if (!mEngine || !ed.ic || mSelectedSound < 0 || ed.loadedSound != mSelectedSound) return;
+  const CodeSynthEntry& entry = mEngine->Entry(mSelectedSound);
+  if (CodeSynthEntryIsReserved(entry)) return;
+  if (!mSoundReplay) mSoundReplay = new SoundReplay();
+  SoundReplay& r = *mSoundReplay;
+
+  // Rebuilt when the body, the probes or the entry changed.
+  bool rebuild = ed.probesDirty || r.codeSerial != ed.codeSerial || r.entry != mSelectedSound || r.type != entry.type;
+  if (rebuild)
+  {
+    char* text = interactive_coding_get_text(ed.ic);
+    std::string body = text ? text : "";
+    if (text) mSys.free(text);
+    r.Release();
+    CodeSynthProbes probes;
+    probes.entryName = entry.name;
+    probes.editorBody = body;
+    for (const CodeEditor::Probe& p : ed.probes) probes.probes.push_back({ p.id, p.lo, p.hi });
+    probes.serial = ed.probeSerial;
+    std::string err;
+    r.fn = CodeSynthCompileProbed(body, entry.type, CodeSynthPreludeFor(mEngine->Entries(), false), false,
+                                  LiveGlobalsFor(false), mEngine->ScreenCtx(), probes, &r.vm, &r.parser, err);
+    r.body = body;
+    r.codeSerial = ed.codeSerial;
+    r.probeSerial = ed.probeSerial;
+    r.entry = mSelectedSound;
+    r.type = entry.type;
+    ed.probesDirty = false;
+  }
+  if (!r.fn) return;
+
+  bool report = ed.resultSerial != r.codeSerial;
+  bool inspect = !ed.probes.empty();
+  if (!report && !inspect) return;
+
+  double args[kCodeSynthWrapParamCount] = {};
+  mEngine->CodeSynthLastVoiceArgs(args);
+  unsigned char frame[kCodeSynthVoiceFrameBytes];
+  if (func_frame_size(r.fn) > sizeof(frame)) return;
+  Args a;
+  args_bind(&a, r.fn, frame, sizeof(frame));
+  CodeSynthSetArgs(&a, r.type, args);
+
+  r.print.clear();
+  vm_set_inspect_sink(r.vm, inspect ? ReplayInspectSink : nullptr, ed.ic);
+  vm_set_inspect_array_sink(r.vm, inspect ? ReplayInspectArrSink : nullptr, ed.ic);
+  vm_set_print_sink(r.vm, report ? ReplayPrintSink : nullptr, &r.print);
+  if (inspect) interactive_coding_inspect_begin(ed.ic, r.probeSerial);
+  VMStatus st = func_run(r.fn, &a, kCodeSynthAudioOpBudget);
+  if (inspect) interactive_coding_inspect_end(ed.ic);
+
+  if (report)
+  {
+    ed.resultSerial = r.codeSerial;
+    interactive_coding_host_begin(ed.ic, r.codeSerial);
+    if (st != VM_OK)
+    {
+      const char* e = vm_last_error(r.vm);
+      interactive_coding_host_error(ed.ic, IC_HOST_RUN, -1, -1, st == VM_BUDGET ? "op budget exhausted" : (e ? e : "runtime failure"));
+    }
+    else
+    {
+      char line[96];
+      VMType rt = func_return_type(r.fn);
+      int shift = vmtype_fx_shift(rt);
+      double v = (double)CodeSynthResultToFloat(rt, &a);
+      if (rt.kind == VMT_VOID)                    snprintf(line, sizeof(line), "(void)");
+      else if (rt.kind == VMT_I32 && shift > 0)   snprintf(line, sizeof(line), "%g (fx%d)", v, shift);
+      else if (rt.kind == VMT_I32)                snprintf(line, sizeof(line), "%g (i32)", v);
+      else if (rt.kind == VMT_F32)                snprintf(line, sizeof(line), "%g (f32)", v);
+      else                                        snprintf(line, sizeof(line), "%g (f64)", v);
+      interactive_coding_host_result(ed.ic, line);
+    }
+    if (!r.print.empty()) interactive_coding_host_print(ed.ic, (const unsigned char*)r.print.data(), (int)r.print.size());
+    interactive_coding_host_end(ed.ic);
+  }
+}
+
+// Once per frame, after the editors drew.
+void SteepSynthControl::UpdateInspection()
+{
+  if (!mPlugin || !mEngine) return;
+  CodeEditor& ved = mVisualEd;
+  if (ved.ic && ved.probesDirty && mSelectedSound >= 0 && ved.loadedSound == mSelectedSound)
+  {
+    CodeSynthProbes probes;
+    // A prelude block has no voice of its own: its probes ride the previewed event.
+    const bool inPrelude = CodeSynthEntryIsReserved(mEngine->Entry(mSelectedSound));
+    probes.inPrelude = inPrelude;
+    if (!inPrelude)                 probes.entryName = mEngine->Entry(mSelectedSound).name;
+    else if (mContextEntry >= 0)    probes.entryName = mEngine->Entry(mContextEntry).name;
+    char* text = interactive_coding_get_text(ved.ic);
+    probes.editorBody = text ? text : "";
+    if (text) mSys.free(text);
+    for (const CodeEditor::Probe& p : ved.probes) probes.probes.push_back({ p.id, p.lo, p.hi });
+    probes.serial = ved.probeSerial;
+    mEngine->SetCodeSynthVisualProbes(probes);
+    ved.probesDirty = false;
+  }
+  ReplaySound();
 }
 
 // Arguments for the wrapped body's live and hover runs: the visual pipeline's
@@ -300,10 +511,31 @@ void SteepSynthControl::PushLiveEdit(const char* liveBody, CodeEditor& ed)
   std::string body = liveBody;
 
   ed.lastSyncedBody = Trimmed(body);
+  // The probes' spans still hold against the new text unless the editor sends
+  // new ones; the compile below finds the body in it.
+  if (ed.isVisual) mEngine->SetCodeSynthVisualProbeBody(body);
   mEngine->EditEntry(mSelectedSound, [&](CodeSynthEntry& e) { (ed.isVisual ? e.visualBody : e.body) = body; });
 
   if (!ed.isVisual && !isPrelude)
     RenderCodeSynthPreview(body, (int)type);
+}
+
+int SteepSynthControl::ResolveContextEntry()
+{
+  if (!mPlugin) return mContextEntry = -1;
+  if (mSelectedSound >= 0 && !CodeSynthEntryIsReserved(mEngine->Entry(mSelectedSound)))
+  {
+    mContextEntryName = mEngine->Entry(mSelectedSound).name;
+    return mContextEntry = mSelectedSound;
+  }
+  auto matches = [&](int i) {
+    return i >= 0 && i < mEngine->EntryCount() && !CodeSynthEntryIsReserved(mEngine->Entry(i))
+        && mEngine->Entry(i).name == mContextEntryName;
+  };
+  if (matches(mContextEntry)) return mContextEntry;
+  for (int i = 0, n = mEngine->EntryCount(); i < n; i++)
+    if (matches(i)) return mContextEntry = i;
+  return mContextEntry = -1;
 }
 
 const cCodeSynthGlobals* SteepSynthControl::LiveGlobalsFor(bool forVisual)
@@ -881,7 +1113,7 @@ void SteepSynthControl::DrawSettingsPage()
   if (ui_button(mUI, "< Back")) mShowSettings = false;
 
   ui_same_line(mUI);
-  ui_label(mUI, "  SETTINGS & EXPORT");
+  ui_label(mUI, "SETTINGS & EXPORT");
 
   ui_blank_row(mUI);
   {
@@ -1522,8 +1754,9 @@ void SteepSynthControl::DrawCodeSynthEditor()
   ApplyPendingWavDrop();
   n = mEngine->EntryCount(); // a drop can have just added one
 
-  // Show the edited entry on the screen while nothing plays.
-  mEngine->SetVisualPreviewEntry(mSelectedSound);
+  // Show the context event on the screen while nothing plays.
+  int contextEntry = ResolveContextEntry();
+  mEngine->SetVisualPreviewEntry(contextEntry);
 
   const int leftW = kLeftColumnWidth;
   const int listTop = kContentRow;
@@ -1548,7 +1781,7 @@ void SteepSynthControl::DrawCodeSynthEditor()
   std::vector<char> inSeq;
   if (filterBySeq) BuildSequenceUsage(mEngine, inSeq);
 
-  ui_set_cursor(mUI, 0, (float)listTop);
+  ui_set_cursor(mUI, 1, (float)listTop);
   ui_push_item_width(mUI, 17);
   if (ui_dropdown_begin(mUI, "Events", kEventFilterShort[mEventFilter], 0))
   {
@@ -1561,6 +1794,7 @@ void SteepSynthControl::DrawCodeSynthEditor()
 
   int shown = 0;
   static const char* kCodeSynthTypeItems[3] = {"f64", "f32", "fix"};
+  const bool selIsPrelude = mSelectedSound >= 0 && CodeSynthEntryIsReserved(mEngine->Entry(mSelectedSound));
   for (int i = 0; i < n && shown < maxListRows; i++)
   {
     // Prelude blocks are always shown, first.
@@ -1581,6 +1815,27 @@ void SteepSynthControl::DrawCodeSynthEditor()
       if (!keep) continue;
     }
 
+    // ">name<" in the selected button's colour marks the editors' context, '-' also on screen.
+    // While a prelude block is open, clicking those marker cells picks the context.
+    const float rowY   = mUI->pen_y;
+    const float closeX = mUI->line_start_x + (float)kNameCells;
+    const bool pickHover = selIsPrelude && !isPrelude && i != contextEntry &&
+                           (ui_hit(mUI, 0.f, rowY, 1.f, 1.f) || ui_hit(mUI, closeX, rowY, 1.f, 1.f));
+    if (pickHover && mUI->mouse_pressed[UI_MOUSE_BUTTON_LEFT])
+    {
+      mContextEntry = contextEntry = i;
+      mContextEntryName = mEngine->Entry(i).name;
+      mEngine->SetVisualPreviewEntry(i);
+    }
+    if (i == contextEntry || pickHover)
+    {
+      const unsigned int col = ui_theme_color(mUI, i == contextEntry ? UI_COL_BUTTON_ACT : UI_COL_BUTTON_HOVER);
+      ui_draw_cell(mUI, 0.f, rowY, '>', col);
+      ui_draw_cell(mUI, closeX, rowY, '<', col);
+    }
+    else if (mEngine->EntryVisuallyRendered(i))
+      ui_draw_cell(mUI, 0.f, mUI->pen_y, '-', ui_theme_color(mUI, UI_COL_LABEL));
+
     // "##e<idx>": names can repeat, and equal ids would select together.
     char label[64];
     s_snprintf(label, sizeof(label), "%s##e%d", mEngine->Entry(i).name.c_str(), i);
@@ -1589,7 +1844,17 @@ void SteepSynthControl::DrawCodeSynthEditor()
     ui_pop_item_width(mUI);
 
     // A prelude block compiles under each body's type, not its own.
-    if (isPrelude) { shown++; continue; }
+    if (isPrelude)
+    {
+      if (mEngine->Entry(i).kind == kEntryGlobals)
+      {
+        ui_same_line_col(mUI, kNameCells + 1);
+        if (ui_button_flags(mUI, "reset##glb", UI_OPTION_NO_MARGIN))
+          mEngine->ResetCodeSynthGlobals();
+      }
+      shown++;
+      continue;
+    }
 
     ui_same_line_col(mUI, kNameCells + 1);
     ui_push_item_width(mUI, 5);
@@ -1814,17 +2079,12 @@ void SteepSynthControl::DrawCodeSynthEditor()
         }
         ui_pop_clip_rect(mUI);
 
-        mEditorCol = soundX;
-        mEditorRow = edTop;
-        mEditorW   = soundW;
-        mEditorH   = edH;
-
         // Over the Results panel, whose split is draggable.
         if (!interactive_coding_get_results_rect(mSoundEd.ic, &mPreviewCol, &mPreviewRow,
                                                  &mPreviewW, &mPreviewH))
         {
-          mPreviewCol = mEditorCol; mPreviewRow = mEditorRow;
-          mPreviewW   = mEditorW;   mPreviewH   = mEditorH;
+          mPreviewCol = soundX; mPreviewRow = edTop;
+          mPreviewW   = soundW; mPreviewH   = edH;
         }
 
         mPreviewCodeOk = interactive_coding_last_run_ok(mSoundEd.ic);
@@ -1848,6 +2108,7 @@ void SteepSynthControl::DrawCodeSynthEditor()
   }
 
   RecordUiState();
+  UpdateInspection();
 
   // Staged only: SetFocus/CreateWindowEx dispatch messages that can re-enter
   // Draw() mid-frame. Applied before the next ui_begin.
@@ -1873,6 +2134,13 @@ void SteepSynthControl::Draw(IGraphics& g)
     mEditorHadOsFocusProxy = mPendingOsFocusProxy;
     PlatformKeyFocus_SetEditorFocused(mPendingOsFocusProxy ? 1 : 0);
   }
+  // wants_escape: last frame's open find dialog; Escape closes it instead of the host window.
+  const bool wantEscape = mScreenFullscreen || (mUI && mUI->wants_escape);
+  if (wantEscape != mEscapeCaptured)
+  {
+    mEscapeCaptured = wantEscape;
+    PlatformKeyFocus_SetCaptureEscape(mEscapeCaptured ? 1 : 0);
+  }
 
   int w = (int)mRECT.W();
   int h = (int)mRECT.H();
@@ -1881,6 +2149,14 @@ void SteepSynthControl::Draw(IGraphics& g)
 
   // Before the regrid check, so a restored size applies this frame.
   bool screenLayoutChanged = SyncScreenResolutionAndDock();
+
+  if (mFontIndex != mFontApplied)
+  {
+    font_settings_free_glyphs(&mSys, &mFontSettings);
+    get_font_by_index(&mSys, mFontIndex, &mFontSettings);
+    font_cache_clear(mFC);
+    mFontApplied = mFontIndex;
+  }
 
   float newScale = g.GetScreenScale() * g.GetDrawScale();
   bool uiScaleChanged = (Ui().uiScale != mUiScale) || (Ui().lineHeight != mLineHeight);
@@ -1893,6 +2169,8 @@ void SteepSynthControl::Draw(IGraphics& g)
     ReallocBackbuffer();
     RebuildUI(PLUG_FPS);
   }
+  else if (ClampScreenZoom(Ui().screenZoom) != mScreenZoomDev)
+    RebuildUI(PLUG_FPS, true);
 
   auto now = std::chrono::steady_clock::now();
   static auto start = now;
@@ -1903,6 +2181,12 @@ void SteepSynthControl::Draw(IGraphics& g)
   mUI->window_has_focus = (PlatformKeyFocus_WindowHasOsFocus() && mMouseInside) ? 1 : 0;
 
   ui_begin(mUI, timeInSeconds);
+
+  DrawScreenBar();
+
+  // Everything else stays left of a docked preview, as when the grid ended there.
+  ui_push_clip_rect(mUI, 0.f, 0.f, (float)mCols, (float)mRows);
+  mUI->content_max_x = (float)mCols;
 
 #if STEEPSYNTH_ENABLE_INDEXYNT
   struct SliderDef { const char* name; int paramIdx; };
@@ -1928,12 +2212,10 @@ void SteepSynthControl::Draw(IGraphics& g)
     // Display scale, not mBackScale, which includes the host's zoom.
     ui_glue_draw_zoom_auto(mUI, &Ui().uiScale, g.GetScreenScale(), &Ui().uiScaleAuto);
 
-    ui_same_line_pad(mUI, 2);
-    ui_glue_draw_grade_lineh(mUI, &Ui().lineHeight,
-                              kUiLineHeightMin, kUiLineHeightDefault, kUiLineHeightMax);        
-
-    ui_same_line_pad(mUI, 2);
-    ui_glue_draw_theme(mUI);
+    ui_same_line(mUI);
+    ui_glue_draw_view_panel(mUI, &Ui().lineHeight,
+                            kUiLineHeightMin, kUiLineHeightDefault, kUiLineHeightMax,
+                            &mFontIndex, gen_font_names, GEN_FONT_COUNT);
   }
 
   bool isCodeSynth = mPlugin && mEngine->GetBackend() == SynthBackend::CodeSynth;
@@ -1942,7 +2224,7 @@ void SteepSynthControl::Draw(IGraphics& g)
   {
     static const char* const kBackendItems[2] = { "Indexynt", "CodeSynth" };
     int backendIdx = isCodeSynth ? 1 : 0;
-    ui_same_line_pad(mUI, 2);
+    ui_same_line(mUI);
     ui_label(mUI, "Backend:");
     ui_same_line(mUI);
     if (ui_option_bar(mUI, "##backend", &backendIdx, 2, kBackendItems, 0) && mPlugin)
@@ -1953,7 +2235,7 @@ void SteepSynthControl::Draw(IGraphics& g)
 #endif
 
   {
-    ui_same_line_pad(mUI, 2);
+    ui_same_line(mUI);
     if (ui_toggle_button(mUI, "Settings & Export", mShowSettings))
       mShowSettings = !mShowSettings;
   }
@@ -2021,6 +2303,7 @@ void SteepSynthControl::Draw(IGraphics& g)
   }
 #endif // STEEPSYNTH_ENABLE_INDEXYNT
 
+  ui_pop_clip_rect(mUI);
   ui_end(mUI);
 
   int need_render = ui_blit_to_textmode(mUI, mTM);
@@ -2031,7 +2314,7 @@ void SteepSynthControl::Draw(IGraphics& g)
     {
       bool showMatrix = mPlugin && mEngine->IsPlaying() && mEngine->HasRecordedMatrix();
       if (showMatrix)
-        PushMatrixPath(mEditorCol, mEditorRow, mEditorW, mEditorH, 0.3f);
+        PushMatrixPath(mPreviewCol, mPreviewRow, mPreviewW, mPreviewH, 0.3f);
       else if (mPreviewValidCount > 1 && mPreviewCodeOk)
         PushPreviewWaveformPath(mPreviewCol, mPreviewRow, mPreviewW, mPreviewH, 0.3f);
     }
@@ -2118,7 +2401,7 @@ bool SteepSynthControl::SyncScreenResolutionAndDock()
 
 bool SteepSynthControl::HitScreenFrame(float x, float y) const
 {
-  if (!mScreenDrawValid) return false;
+  if (!mScreenDrawValid || HitScreenBar(x, y)) return false;
   const float g = kScreenGrab;
   const bool inOuter = x >= mScreenDrawX - g && x <= mScreenDrawX + mScreenDrawW + g &&
                        y >= mScreenDrawY - g && y <= mScreenDrawY + mScreenDrawH + g;
@@ -2152,23 +2435,33 @@ void SteepSynthControl::DockScreen()
   mScreenDragging = false;
 }
 
-void SteepSynthControl::DrawVirtualScreen(IGraphics& g)
+// Size and origin snapped to the device-pixel grid; fullscreen takes an integer zoom.
+bool SteepSynthControl::ScreenImageRect(float& x, float& y, float& w, float& h) const
 {
-  NVGcontext* vg = (NVGcontext*)g.GetDrawContext();
-  if (!vg) return;
-
   RenderCtx* screen = mPlugin ? mEngine->ScreenCtx() : nullptr;
   const int srcW = vscreen_width_ctx(screen);
   const int srcH = vscreen_height_ctx(screen);
-  if (srcW <= 0 || srcH <= 0) return;
+  if (srcW <= 0 || srcH <= 0) return false;
 
-  // Integer zoom, with the origin snapped to the device-pixel grid.
   const float scale = mBackScale > 0.f ? mBackScale : 1.f;
-  const float sw = (float)(srcW * mScreenZoomDev) / scale;
-  const float sh = (float)(srcH * mScreenZoomDev) / scale;
+  float zoom = mScreenZoomDev;
+  if (mScreenFullscreen)
+  {
+    const int zx = (int)(mRECT.W() * scale) / srcW;
+    const int zy = (int)(mRECT.H() * scale) / srcH;
+    zoom = (float)(zx < zy ? zx : zy);
+    if (zoom < 1.f) zoom = 1.f;
+  }
+  const float sw = std::floor((float)srcW * zoom + 0.5f) / scale;
+  const float sh = std::floor((float)srcH * zoom + 0.5f) / scale;
 
   float px, py;
-  if (Ui().screenDocked)
+  if (mScreenFullscreen)
+  {
+    px = mRECT.L + (mRECT.W() - sw) * 0.5f;
+    py = mRECT.T + (mRECT.H() - sh) * 0.5f;
+  }
+  else if (Ui().screenDocked)
   {
     px = mRECT.R - mScreenPanelW + kScreenMargin;
     py = mRECT.T + kScreenMargin;
@@ -2178,12 +2471,197 @@ void SteepSynthControl::DrawVirtualScreen(IGraphics& g)
     px = mRECT.L + Ui().screenPosX * mRECT.W();
     py = mRECT.T + Ui().screenPosY * mRECT.H();
   }
-  const float sx = std::floor(px * scale + 0.5f) / scale;
-  const float sy = std::floor(py * scale + 0.5f) / scale;
+  x = std::floor(px * scale + 0.5f) / scale;
+  y = std::floor(py * scale + 0.5f) / scale;
+  w = sw; h = sh;
+  return true;
+}
+
+void SteepSynthControl::DrawScreenBar()
+{
+  mScreenBarRows = 0;
+  float sx, sy, sw, sh;
+  if (mScreenFullscreen || !ScreenImageRect(sx, sy, sw, sh)) return;
+
+  // - and + go to the whole number below / above, or one past it when already whole.
+  const float zoom = mScreenZoomDev;
+  const float whole = std::floor(zoom + 0.5f);
+  const bool isWhole = std::fabs(zoom - whole) < 0.005f;
+  const float prevZ = isWhole ? whole - 1.f : std::floor(zoom);
+  const float nextZ = isWhole ? whole + 1.f : std::ceil(zoom);
+  const bool canPrev = prevZ >= 1.f;
+  const bool canNext = nextZ <= MaxScreenZoom() + 0.005f;
+
+  char value[16];
+  const int hundredths = (int)(zoom * 100.f + 0.5f);
+  if (hundredths % 100 == 0)      s_snprintf(value, sizeof(value), "%d", hundredths / 100);
+  else if (hundredths % 10 == 0)  s_snprintf(value, sizeof(value), "%d.%d", hundredths / 100, hundredths / 10 % 10);
+  else                            s_snprintf(value, sizeof(value), "%d.%d%d", hundredths / 100, hundredths / 10 % 10, hundredths % 10);
+  const char* fsLabel = "fullscreen";
+  const char* kPrev   = "-##screenzoom";
+  const char* kNext   = "+##screenzoom";
+
+  // Under the frame ring, at the preview's own fractional cell position; the zoom label
+  // goes first when the controls don't fit on one line, and only then a second row.
+  const int fsW        = ui_display_len(fsLabel) + 2;
+  const int scaleBareW = 3 + 1 + ui_display_len(value) + 1 + 3;
+  const int scaleW     = 4 + 1 + scaleBareW;
+  const float ring = kScreenBezel + 1.f;
+  float col = sx / mCellW;
+  if (col < 0.f) col = 0.f;
+  const bool withLabel = col + fsW + 3 + scaleW <= mGridCols;
+  const bool oneRow    = withLabel || col + fsW + 3 + scaleBareW <= mGridCols;
+  const bool showLabel = false;//withLabel || !oneRow;
+  const int rows = oneRow ? 1 : 2;
+  float row = (sy + sh + ring) / mCellH;
+  if (row + rows > mRows) row = (sy - ring) / mCellH - rows;
+  if (row < 0.f) row = 0.f;
+
+  ui_set_cursor(mUI, col, row);
+  if (ui_button(mUI, fsLabel))
+    mScreenFullscreen = true;
+  float right = mUI->last_x + mUI->last_w;
+  if (oneRow) ui_same_line_pad(mUI, 1);
+
+  if (showLabel)
+  {
+    ui_label(mUI, "zoom");
+    ui_same_line(mUI);
+  }
+  if (!canPrev) ui_begin_disabled(mUI);
+  if (ui_button(mUI, kPrev)) Ui().screenZoom = ClampScreenZoom(prevZ);
+  if (!canPrev) ui_end_disabled(mUI);
+  ui_same_line(mUI);
+  ui_label(mUI, value);
+  ui_same_line(mUI);
+  if (!canNext) ui_begin_disabled(mUI);
+  if (ui_button(mUI, kNext)) Ui().screenZoom = ClampScreenZoom(nextZ);
+  if (!canNext) ui_end_disabled(mUI);
+  const float scaleRight = mUI->last_x + mUI->last_w;
+  if (scaleRight > right) right = scaleRight;
+
+  mScreenBarCol  = col;
+  mScreenBarRow  = row;
+  mScreenBarCols = right - col;
+  mScreenBarRows = rows;
+
+  // The textarea hit-tests raw, so a floating preview's editor would take the press too.
+  if (ui_hit_raw(mUI, col, row, mScreenBarCols, (float)rows))
+    for (int b = 0; b < 3; b++) ui_consume_mouse_press(mUI, b);
+}
+
+// The largest zoom that still fits the control, leaving the bar its rows and,
+// docked, the editor a sliver.
+float SteepSynthControl::MaxScreenZoom() const
+{
+  RenderCtx* screen = mPlugin ? mEngine->ScreenCtx() : nullptr;
+  const int srcW = vscreen_width_ctx(screen);
+  const int srcH = vscreen_height_ctx(screen);
+  if (srcW <= 0 || srcH <= 0) return kScreenZoomMin;
+
+  const float scale = mBackScale > 0.f ? mBackScale : 1.f;
+  const float availW = (mRECT.W() - kScreenMargin * 2) * scale - (Ui().screenDocked ? 64.f : 0.f);
+  const float availH = (mRECT.H() - kScreenMargin * 2 - kScreenBezel - 1.f - mCellH * 2) * scale;
+  float z = availW / (float)srcW;
+  if (availH / (float)srcH < z) z = availH / (float)srcH;
+  if (z > kScreenZoomMax) z = kScreenZoomMax;
+  if (z < kScreenZoomMin) z = kScreenZoomMin;
+  return z;
+}
+
+int SteepSynthControl::HitScreenCorner(float x, float y) const
+{
+  if (!mScreenDrawValid || HitScreenBar(x, y)) return -1;
+  const float g = kScreenGrab, c = kScreenCornerGrab;
+  const float x0 = mScreenDrawX, y0 = mScreenDrawY;
+  const float x1 = x0 + mScreenDrawW, y1 = y0 + mScreenDrawH;
+  if (x < x0 - g || x > x1 + g || y < y0 - g || y > y1 + g) return -1;
+  if (x >= x0 && x < x1 && y >= y0 && y < y1) return -1;
+  const bool l = x < x0 + c, r = x > x1 - c, t = y < y0 + c, b = y > y1 - c;
+  if (t && l) return 0;
+  if (t && r) return 1;
+  if (b && l) return 2;
+  if (b && r) return 3;
+  return -1;
+}
+
+bool SteepSynthControl::HitScreenDivider(float x, float y) const
+{
+  if (!mScreenDrawValid || !Ui().screenDocked || HitScreenBar(x, y)) return false;
+  const float dx = mScreenDrawX - kScreenMargin;
+  return std::fabs(x - dx) <= kScreenDividerGrab && y >= mRECT.T && y < mRECT.B;
+}
+
+// Docked, every corner grows toward the bottom-left, away from the fixed top-right.
+void SteepSynthControl::ScreenResizeGrowsLeftUp(bool& left, bool& top) const
+{
+  const bool docked = Ui().screenDocked;
+  left = docked || mScreenResizeCorner == 0 || mScreenResizeCorner == 2;
+  top  = !docked && (mScreenResizeCorner == 0 || mScreenResizeCorner == 1);
+}
+
+// mScreenDragOff* holds how far outside the image the press landed, so the
+// first move doesn't jump by the ring width.
+void SteepSynthControl::ResizeScreenTo(float x, float y, bool snap)
+{
+  RenderCtx* screen = mPlugin ? mEngine->ScreenCtx() : nullptr;
+  const int srcW = vscreen_width_ctx(screen);
+  const int srcH = vscreen_height_ctx(screen);
+  if (srcW <= 0 || srcH <= 0) return;
+
+  const float scale = mBackScale > 0.f ? mBackScale : 1.f;
+  bool left, top;
+  ScreenResizeGrowsLeftUp(left, top);
+  const float dx = (left ? mScreenResizeAnchorX - x : x - mScreenResizeAnchorX) - mScreenDragOffX;
+  const float dy = (top  ? mScreenResizeAnchorY - y : y - mScreenResizeAnchorY) - mScreenDragOffY;
+  float z = dx / (float)srcW;
+  if (mScreenResizeCorner != kScreenDividerCorner && dy / (float)srcH > z) z = dy / (float)srcH;
+  z *= scale;
+  if (snap)
+  {
+    const float n = std::floor(z + 0.5f);
+    if (n >= 1.f && std::fabs(z - n) <= n * kScreenZoomSnap)
+      z = n;
+  }
+  const float maxZ = MaxScreenZoom();
+  if (z > maxZ) z = maxZ;
+  if (z < kScreenZoomMin) z = kScreenZoomMin;
+  Ui().screenZoom = z;
+
+  // Docked, the panel itself keeps the top-right corner in place.
+  if (Ui().screenDocked) return;
+  const float w = std::floor((float)srcW * z + 0.5f) / scale;
+  const float h = std::floor((float)srcH * z + 0.5f) / scale;
+  const float px = left ? mScreenResizeAnchorX - w : mScreenResizeAnchorX;
+  const float py = top  ? mScreenResizeAnchorY - h : mScreenResizeAnchorY;
+  const float cw = mRECT.W() > 1.f ? mRECT.W() : 1.f;
+  const float ch = mRECT.H() > 1.f ? mRECT.H() : 1.f;
+  Ui().screenPosX = (px - mRECT.L) / cw;
+  Ui().screenPosY = (py - mRECT.T) / ch;
+}
+
+bool SteepSynthControl::HitScreenBar(float x, float y) const
+{
+  if (mScreenBarRows <= 0) return false;
+  const float bx = mScreenBarCol * mCellW, by = mScreenBarRow * mCellH;
+  return x >= bx && x < bx + mScreenBarCols * mCellW &&
+         y >= by && y < by + mScreenBarRows * mCellH;
+}
+
+void SteepSynthControl::DrawVirtualScreen(IGraphics& g)
+{
+  NVGcontext* vg = (NVGcontext*)g.GetDrawContext();
+  if (!vg) return;
+
+  RenderCtx* screen = mPlugin ? mEngine->ScreenCtx() : nullptr;
+  const int srcW = vscreen_width_ctx(screen);
+  const int srcH = vscreen_height_ctx(screen);
+  float sx, sy, sw, sh;
+  if (!ScreenImageRect(sx, sy, sw, sh)) return;
 
   mScreenDrawX = sx; mScreenDrawY = sy;
   mScreenDrawW = sw; mScreenDrawH = sh;
-  mScreenDrawValid = true;
+  mScreenDrawValid = !mScreenFullscreen;
 
   unsigned int gen = vscreen_generation_ctx(screen);
   const bool pebblePal = mPlugin->GetExportSettings().target == kExportTargetPebble;
@@ -2220,7 +2698,14 @@ void SteepSynthControl::DrawVirtualScreen(IGraphics& g)
   if (!mScreenImageValid) return;
 
   const float b = kScreenBezel;
-  if (!Ui().screenDocked)
+  if (mScreenFullscreen)
+  {
+    nvgBeginPath(vg);
+    nvgRect(vg, mRECT.L, mRECT.T, mRECT.W(), mRECT.H());
+    nvgFillColor(vg, nvgRGBA(0, 0, 0, 255));
+    nvgFill(vg);
+  }
+  else if (!Ui().screenDocked)
   {
     nvgBeginPath(vg);
     nvgRoundedRect(vg, sx - b, sy - b, sw + b * 2, sh + b * 2, 6.f);
@@ -2228,12 +2713,25 @@ void SteepSynthControl::DrawVirtualScreen(IGraphics& g)
     nvgFill(vg);
   }
 
-  nvgBeginPath(vg);
-  nvgRoundedRect(vg, sx - b, sy - b, sw + b * 2, sh + b * 2, 6.f);
-  nvgStrokeColor(vg, mScreenDragging ? nvgRGBA(170, 170, 170, 255)
-                                     : nvgRGBA(90, 90, 90, 255));
-  nvgStrokeWidth(vg, 2.f);
-  nvgStroke(vg);
+  if (!mScreenFullscreen && Ui().screenDocked)
+  {
+    const bool active = mScreenDividerHover || mScreenResizeCorner == kScreenDividerCorner;
+    const float dx = std::floor((sx - kScreenMargin) * mBackScale + 0.5f) / mBackScale;
+    nvgBeginPath(vg);
+    nvgRect(vg, dx - (active ? 1.f : 0.5f), mRECT.T, active ? 2.f : 1.f, mRECT.H());
+    nvgFillColor(vg, active ? nvgRGBA(88, 88, 88, 255) : nvgRGBA(60, 60, 60, 255));
+    nvgFill(vg);
+  }
+
+  if (!mScreenFullscreen)
+  {
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, sx - b, sy - b, sw + b * 2, sh + b * 2, 6.f);
+    const bool held = mScreenDragging || mScreenResizeCorner >= 0;
+    nvgStrokeColor(vg, held ? nvgRGBA(170, 170, 170, 255) : nvgRGBA(90, 90, 90, 255));
+    nvgStrokeWidth(vg, 2.f);
+    nvgStroke(vg);
+  }
 
   NVGpaint paint = nvgImagePattern(vg, sx, sy, sw, sh, 0.f, mScreenNVGImage, 1.f);
   nvgBeginPath(vg);
@@ -2258,6 +2756,29 @@ void SteepSynthControl::OnMouseDown(float x, float y, const IMouseMod& mod)
   mMouseInside = true;
   mMouseButton = mod.L ? 0 : (mod.R ? 2 : 1);
 
+  if (mScreenFullscreen)
+  {
+    mScreenFullscreen = false;
+    mScreenFullscreenExitHeld = true;
+    SetDirty(false);
+    return;
+  }
+
+  int corner = mod.L ? HitScreenCorner(x, y) : -1;
+  if (corner < 0 && mod.L && HitScreenDivider(x, y)) corner = kScreenDividerCorner;
+  if (corner >= 0)
+  {
+    mScreenResizeCorner = corner;
+    bool left, top;
+    ScreenResizeGrowsLeftUp(left, top);
+    mScreenResizeAnchorX = left ? mScreenDrawX + mScreenDrawW : mScreenDrawX;
+    mScreenResizeAnchorY = top  ? mScreenDrawY + mScreenDrawH : mScreenDrawY;
+    mScreenDragOffX = (left ? mScreenResizeAnchorX - x : x - mScreenResizeAnchorX) - mScreenDrawW;
+    mScreenDragOffY = (top  ? mScreenResizeAnchorY - y : y - mScreenResizeAnchorY) - mScreenDrawH;
+    SetDirty(false);
+    return;
+  }
+
   if (mod.L && HitScreenFrame(x, y))
   {
     mScreenDragging = true;
@@ -2276,6 +2797,14 @@ void SteepSynthControl::OnMouseDblClick(float x, float y, const IMouseMod& mod)
   mMouseInside = true;
   mMouseButton = mod.L ? 0 : (mod.R ? 2 : 1);
 
+  if (mScreenFullscreen)
+  {
+    mScreenFullscreen = false;
+    mScreenFullscreenExitHeld = true;
+    SetDirty(false);
+    return;
+  }
+
   if (mod.L && HitScreenFrame(x, y))
   {
     DockScreen();
@@ -2292,9 +2821,12 @@ void SteepSynthControl::OnMouseUp(float x, float y, const IMouseMod& mod)
   mMouseInside = true;
 
   // Swallowed: the UI never saw the matching DOWN.
-  if (mScreenDragging)
+  if (mScreenDragging || mScreenResizeCorner >= 0 || mScreenFullscreenExitHeld)
   {
+    if (mScreenResizeCorner >= 0) ResizeScreenTo(x, y, true);
     mScreenDragging = false;
+    mScreenResizeCorner = -1;
+    mScreenFullscreenExitHeld = false;
     mMouseButton = -1;
     SetDirty(false);
     return;
@@ -2314,6 +2846,13 @@ void SteepSynthControl::OnMouseDrag(float x, float y, float dX, float dY, const 
     SetDirty(false);
     return;
   }
+  if (mScreenResizeCorner >= 0)
+  {
+    ResizeScreenTo(x, y);
+    SetDirty(false);
+    return;
+  }
+  if (mScreenFullscreenExitHeld) return;
 
   ui_os_mouse_event(mUI, x, y, 0.f, UI_MOUSE_TYPE_DRAG, mMouseButton, ModFlags(mod));
   SetDirty(false);
@@ -2321,18 +2860,36 @@ void SteepSynthControl::OnMouseDrag(float x, float y, float dX, float dY, const 
 void SteepSynthControl::OnMouseWheel(float x, float y, const IMouseMod& mod, float d)
 {
   mMouseInside = true;
+  if (mScreenFullscreen) return;
   ui_os_mouse_event(mUI, x, y, d, UI_MOUSE_TYPE_WHEEL, -1, ModFlags(mod));
   SetDirty(false);
 }
 void SteepSynthControl::OnMouseOver(float x, float y, const IMouseMod& mod)
 {
   mMouseInside = true;
+  int corner = HitScreenCorner(x, y);
+  if (corner < 0 && HitScreenDivider(x, y)) corner = kScreenDividerCorner;
+  if ((corner == kScreenDividerCorner) != mScreenDividerHover)
+  {
+    mScreenDividerHover = corner == kScreenDividerCorner;
+    SetDirty(false);
+  }
+  if (GetUI() && (corner >= 0 || mScreenCursorSet))
+  {
+    GetUI()->SetMouseCursor(corner < 0 ? ECursor::ARROW
+                          : corner == kScreenDividerCorner ? ECursor::SIZEWE
+                          : (corner == 0 || corner == 3) ? ECursor::SIZENWSE : ECursor::SIZENESW);
+    mScreenCursorSet = corner >= 0;
+  }
   ui_os_mouse_event(mUI, x, y, 0.f, UI_MOUSE_TYPE_MOVE, -1, ModFlags(mod));
   SetDirty(false);
 }
 void SteepSynthControl::OnMouseOut()
 {
   mMouseInside = false;
+  if (mScreenCursorSet && GetUI()) GetUI()->SetMouseCursor(ECursor::ARROW);
+  mScreenCursorSet = false;
+  mScreenDividerHover = false;
   ui_os_mouse_event(mUI, -1.f, -1.f, 0.f, UI_MOUSE_TYPE_MOVE, -1, 0);
   SetDirty(false);
 }
@@ -2374,6 +2931,12 @@ static int ModFlags(const IKeyPress& key)
 bool SteepSynthControl::OnKeyDown(float /* x */, float /* y */, const IKeyPress& key)
 {
   if (!mUI) return false;
+  if (mScreenFullscreen && key.VK == kVK_ESCAPE)
+  {
+    mScreenFullscreen = false;
+    SetDirty(false);
+    return true;
+  }
   int flags = ModFlags(key);
   ui_os_key_event(mUI, MapKeycode(key.VK), 1, flags);
 

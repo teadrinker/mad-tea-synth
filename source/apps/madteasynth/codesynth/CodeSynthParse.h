@@ -86,6 +86,8 @@ class cCodeSynthGlobals
 public:
   VMGlobalTable table{};
   std::vector<unsigned char> block;
+  // `block` as the initialiser left it.
+  std::vector<unsigned char> initBlock;
   bool        valid = false;   // true once Build() succeeded (or found nothing to do)
   std::string error;           // compile error from the declaration pass, if any
 
@@ -101,6 +103,11 @@ public:
 
   // Re-zero and re-run the initialisers, so a preview starts every run alike.
   void ResetValues();
+
+  // Realtime-safe: no allocation, no VM run.
+  // After a recompile: keeps `prev`'s running values where vm_globals_migrate allows.
+  void TakeValuesFrom(const cCodeSynthGlobals& prev);
+  void RestoreInitValues();
 
   bool   Empty() const { return table.count == 0; }
   void*  Data()        { return block.empty() ? nullptr : block.data(); }
@@ -135,6 +142,7 @@ public:
   int           synthRootNote[128]; // mapping metadata only; pitch is A4-relative
   int           synthTranspose[128]; // semitones added to the played note before pitching
   int           synthOrder[128];     // process-order hint; offline exporter only
+  unsigned      probeSerial = 0;     // the CodeSynthProbes::serial compiled in, 0 for none
 
   cCodeSynthReadonly() { memset(map, 0, sizeof(map)); memset(synthRootNote, 0, sizeof(synthRootNote)); memset(synthTranspose, 0, sizeof(synthTranspose)); memset(synthOrder, 0, sizeof(synthOrder)); }
 };
@@ -183,8 +191,41 @@ cSampleData* CodeSynthLoadBodySample(const std::string& body, const char* assetD
 constexpr const char* kCodeSynthDefaultWavBody = "smp(rate, 0)";
 
 
+// One entry's inspection probes (vm_set_inspect_probes), as byte spans of
+// `editorBody`: the editor's text, inside which the compiled body is found.
+struct CodeSynthProbe { int id; size_t lo, hi; };
+struct CodeSynthProbes {
+  std::string entryName;
+  std::string editorBody;
+  std::vector<CodeSynthProbe> probes;
+  unsigned serial = 0;
+  bool inPrelude = false;
+};
+
+// Where the visual pipeline's inspection goes, on the UI thread: one pass per
+// visual tick (begin, the values, end), quoting the probe serial the running
+// pipeline was compiled with; and `ran`, once after each new pipeline, with
+// what the open entry's first run printed.
+struct CodeSynthInspectListener {
+  void* user = nullptr;
+  void (*begin)(void* user, unsigned probeSerial) = nullptr;
+  void (*value)(void* user, int id, int kind, int shift, double v) = nullptr;
+  void (*array)(void* user, int id, int kind, int shift, int total, const double* vals, int n) = nullptr;
+  void (*end)(void* user) = nullptr;
+  void (*ran)(void* user, bool ok, const char* print, int printLen) = nullptr;
+};
+
 // `forVisual` picks which body of each entry compiles. Empty bodies are skipped.
-bool CodeSynthParse(const char* specification, const char* workingDirectoryPath, cCodeSynthReadonly* dest, int debugMessagesMaxSize, const char* debugMessages, RenderCtx* screen, bool forVisual = false);
+// `probes` names the entry whose body they are compiled into.
+bool CodeSynthParse(const char* specification, const char* workingDirectoryPath, cCodeSynthReadonly* dest, int debugMessagesMaxSize, const char* debugMessages, RenderCtx* screen, bool forVisual = false,
+                    const CodeSynthProbes* probes = nullptr);
+
+// One body compiled as the pipelines compile it, with `probes` in, for the
+// editor's replay of the open entry. Release with CodeSynthReleaseExport(vm,
+// parser, nullptr). NULL on failure, with `err` set.
+Func* CodeSynthCompileProbed(const std::string& body, CodeSynthType type, const std::string& prelude,
+                             bool forVisual, const cCodeSynthGlobals* globals, RenderCtx* screen,
+                             const CodeSynthProbes& probes, VM** outVm, Parser** outParser, std::string& err);
 
 // Compiles one body standalone, for the exporter and the editor's preview.
 // `globals` must be built from the same source as `prelude`. The VM, parser and

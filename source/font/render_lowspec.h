@@ -277,11 +277,11 @@ int glyph_lowspec_ascii_slot(int ascii);
 // aaline_polygon as the aaline blend_option, which only consults it under
 // AALINE_PLOT_4_X_64 -- elsewhere that path is still effectively screen.
 //
-// BLEND_LOCK_R / _G / _B (2 / 4 / 8) join it in the same field and leave that
-// GColor8 channel of the destination untouched, so blend = BLEND_LOCK_G |
-// BLEND_LOCK_B writes red only. Unified-blend path only (USE_UNIFIED_BLEND),
-// and meaningless -- hence ignored -- on an 8-bit gray destination, which has
-// no channels.
+// BLEND_LOCK_CH0 / _CH1 / _CH2 (2 / 4 / 8) join it in the same field and leave
+// that channel of the destination untouched, counting from the low bits: on
+// GColor8 blend = 2 | 4 writes red only. Unified-blend path only
+// (USE_UNIFIED_BLEND), and ignored on a one-channel destination (8-bit gray or
+// a single-channel RSurface::layout).
 //
 // That mode is only the LOW 16 BITS of `blend`. Above it sit flags describing
 // the destination, currently just BLEND_8BIT_GRAYSCALE (common/render_surface.h,
@@ -498,9 +498,10 @@ void render_point(const RSurface *surf, fx16 x, fx16 y, fx16 amount, int blend);
 // alpha-blend per pixel. `blend` selects the
 // compositing mode, same convention as render_glyph_lowspec_ascii: 0 =
 // "screen" (blend toward `col`), 1 = "inverted" (blend toward each pixel's own
-// inverse, ignoring `col`). Blending is per-2-bit-RGB-channel under
-// RS_PEBBLE_TIME2, else a single 8-bit gray channel; alpha>=FX16_ONE with
-// blend==0 takes a fast path that writes `col` verbatim.
+// inverse, ignoring `col`). Blending is per channel of the destination's
+// encoding (GColor8 under RS_PEBBLE_TIME2, else surf->layout, else one 8-bit
+// gray channel); alpha>=FX16_ONE with blend==0 takes a fast path that writes
+// `col` verbatim.
 void render_rect(const RSurface *surf, fx16 x, fx16 y, fx16 w, fx16 h, int col, fx16 alpha,
                  int blend, struct RBlendCache *blend_cache);
 

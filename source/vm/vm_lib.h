@@ -103,6 +103,14 @@
 #define VM_LIB_SRC_PROJECT \
     "project = (p, f) => [p[0] * f / p[2], p[1] * f / p[2]]\n"
 
+// ---- colour ----
+// A palette entry: 0xAABBGGRR, red in the LOW byte, alpha opaque, each channel
+// clamped to 0..255. Source rather than a host native so every backend gets it,
+// including the ones with no way to call into C.
+#define VM_LIB_SRC_RGB \
+    "rgb = (r, g, b) => min(max(i32(r), 0), 255) | (min(max(i32(g), 0), 255) << 8)" \
+    " | (min(max(i32(b), 0), 255) << 16) | (255 << 24)\n"
+
 // ---- geometry, GLSL names and argument order ----
 // Integer literals throughout, never 2.0 / 1.0: an int operand takes the other
 // side's kind, so [3]f32 in gives [3]f32 out and fx8 stays fx8, where a float

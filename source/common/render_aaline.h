@@ -101,18 +101,12 @@ static inline void aaline_blend(const RSurface *surf, int id, int px, int py,
     // on an 8-bit gray destination. A touch over 255 at full coverage, which
     // the level clamp in rb_px absorbs.
     int cov = (alpha_fx + 128) >> 8;
-  #if RS_PEBBLE_TIME2
     // One loop-invariant branch, not the two the legacy path pays. aaline has
     // no loop to hoist it out of (Wu plots scattered pixels, not spans -- see
     // the plan's 3.8), so it lands here.
-    if (rb->gray8) surf->pixels[id] = rb_px_gray(rb, (unsigned)cur, cov);
-    else           surf->pixels[id] = rb_px(rb, (unsigned)cur, cov, RB_DITHER_AT(px, py));
-  #else
-    // This build's byte IS an 8-bit gray, so the flag cannot change anything
-    // and the branch folds away.
     (void)px; (void)py;
-    surf->pixels[id] = rb_px_gray(rb, (unsigned)cur, cov);
-  #endif
+    if (rb->gray8) surf->pixels[id] = rb_px_gray(rb, (unsigned)cur, cov);
+    else           surf->pixels[id] = RB_PX_A(rb, (unsigned)cur, cov, px, py);
 #else
     // Decode/encode via render_surface.h so this blends correctly against a
     // GColor8 framebuffer (RS_PEBBLE_TIME2), not just an 8-bit gray tile --
@@ -176,7 +170,7 @@ static inline void aapixel(const RSurface *surf, fixed x, fixed y, fixed amount,
     c1 = fixed_mul(c1, t1);                  // top-left
     c2 = fixed_mul(c2, t1);                  // top-right
 
-    RBlend rb = rb_make(blend_option, -1, FIXED_ONE);
+    RBlend rb = RB_MAKE(surf, blend_option, -1, FIXED_ONE);
     int id = iy * surf->stride + ix;
     aaline_blend(surf, id,                    ix,     iy,     c1, blend_option, &rb);
     aaline_blend(surf, id + 1,                ix + 1, iy,     c2, blend_option, &rb);
@@ -190,7 +184,7 @@ static inline void aaline(const RSurface *surf, fixed x0, fixed y0, fixed a0, fi
     // caller's alpha is already folded into a0/a1, which arrive as per-pixel
     // coverage; the RBlend carries only the mode, the channel mask and the
     // destination encoding.
-    RBlend rb = rb_make(blend_option, -1, FIXED_ONE);
+    RBlend rb = RB_MAKE(surf, blend_option, -1, FIXED_ONE);
 
     // See AALINE_PIXEL_CENTRE_BIAS above. Before the clip, so everything from
     // here down -- clipper included -- works in plain pixel-index space.

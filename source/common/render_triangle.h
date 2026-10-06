@@ -47,7 +47,7 @@
 // every other one and screen/inverted come out the same. REPLACE is the only
 // thing here no other backend has, and it is a bit of its own -- it cannot be
 // 0, because 0 is what "screen over every channel" looks like, and it cannot
-// be 2, because that is BLEND_LOCK_R.
+// be 2, because that is BLEND_LOCK_CH0.
 //
 // The flags above bit 15 (BLEND_8BIT_GRAYSCALE and friends) ride along in the
 // same int, hence the masked reads below rather than raw ==.
@@ -106,19 +106,32 @@ static inline void tri_span(const RSurface* surf, int y, int xs, int xe, int col
                 return;
             }
         }
+#elif RB_LAYOUTS
+        // `color` is a 0..255 gray; a runtime layout encodes it, and its locks
+        // hold against a store as they do against a blend.
+        const RLayout *l = surf->layout;
+        if (l && !l->gray8 && !rs_blend_gray8(blending_flags)) {
+            int keep = rlayout_locked_bits(l, rs_blend_flags(blending_flags));
+            px = l->enc8[color < 0 ? 0 : (color > 255 ? 255 : color)];
+            if (keep) {
+                px = (unsigned char)(px & ~keep);
+                for (int x = xs; x < xe; x++) row[x] = (unsigned char)(px | (row[x] & keep));
+                return;
+            }
+        }
 #endif
         for (int x = xs; x < xe; x++) row[x] = px;
         return;
     }
 #if USE_UNIFIED_BLEND
     (void)color;
-  #if RS_PEBBLE_TIME2
+  #if RB_LUT_ENABLED
     if (lut) {
         // The whole blend, per-channel (and dithered under RB_DITHER, where
         // RB_LUT_PHASE stops folding to 0), in one indexed load -- this is what
         // constant coverage buys.
         for (int x = xs; x < xe; x++)
-            row[x] = lut->t[RB_LUT_PHASE(x, y)][row[x] & 0x3F];
+            row[x] = RB_LUT_AT(lut, x, y, row[x]);
         return;
     }
   #else
@@ -214,7 +227,7 @@ static void triangle_fill(const RSurface* surf, int x1, int y1, int x2, int y2, 
     RBlendCache local;                        // only touched when bc == 0
     if (!bc) { rb_cache_reset(&local); bc = &local; }
     triangle_fill_lut(surf, x1, y1, x2, y2, x3, y3, color, blending_flags,
-                      rb_lut_get(bc, blending_flags, -1, color));
+                      RB_LUT_GET(bc, surf, blending_flags, -1, color));
 }
 
 // Fills a *convex* polygon as a triangle fan from vertex 0: n distinct
@@ -238,7 +251,7 @@ static void triangle_fill_convex_polygon(const RSurface* surf, const int* pts_xy
     if (n < 3) return;
     RBlendCache local;                        // only touched when bc == 0
     if (!bc) { rb_cache_reset(&local); bc = &local; }
-    const RBlendLut* l = rb_lut_get(bc, blending_flags, -1, color);  // once, not n-2 times
+    const RBlendLut* l = RB_LUT_GET(bc, surf, blending_flags, -1, color);  // once, not n-2 times
     for (int i = 1; i + 1 < n; i++)
         triangle_fill_lut(surf, pts_xy[0], pts_xy[1],
                                 pts_xy[2*i],     pts_xy[2*i + 1],

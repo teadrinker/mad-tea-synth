@@ -113,8 +113,9 @@ unsigned int ui_theme_color(const UIContext *ui, int slot) {
     // Blend after grading, never before: the lift is a fraction of the distance
     // between the two ends the theme actually paints, so a slot keeps the same
     // relative separation from its own text once the knobs have moved them.
-    return ui_blend_bg_towards_fg(ui_theme_adjust(ui, ui->theme[slot]),
-                                  ui->theme_blend[slot]);
+    unsigned int c = ui_blend_bg_towards_fg(ui_theme_adjust(ui, ui->theme[slot]),
+                                            ui->theme_blend[slot]);
+    return ui->theme_bg_lift ? ui_adjust_color_additive(ui, c, 0, ui->theme_bg_lift) : c;
 }
 
 
@@ -236,36 +237,38 @@ static unsigned int ui_dim_color(UIContext *ui, unsigned int c) {
 // scrollbar and the textarea test ui->mouse_x / ui->wheel / the key queue
 // themselves, so anything short of blanking the state would need every widget
 // to opt in (and every future one to remember to).
-static void ui_disable_park_input(UIContext *ui) {
-    ui->saved_mouse_x  = ui->mouse_x;  ui->saved_mouse_y  = ui->mouse_y;
-    ui->saved_mouse_dx = ui->mouse_dx; ui->saved_mouse_dy = ui->mouse_dy;
-    ui->saved_wheel    = ui->wheel;
+static void ui_input_park(UIContext *ui, UIInputSnapshot *s, int keys) {
+    s->mouse_x  = ui->mouse_x;  s->mouse_y  = ui->mouse_y;
+    s->mouse_dx = ui->mouse_dx; s->mouse_dy = ui->mouse_dy;
+    s->wheel    = ui->wheel;
     for (int b = 0; b < 3; b++) {
-        ui->saved_mouse_down[b]     = ui->mouse_down[b];
-        ui->saved_mouse_pressed[b]  = ui->mouse_pressed[b];
-        ui->saved_mouse_released[b] = ui->mouse_released[b];
+        s->mouse_down[b]     = ui->mouse_down[b];
+        s->mouse_pressed[b]  = ui->mouse_pressed[b];
+        s->mouse_released[b] = ui->mouse_released[b];
         ui->mouse_down[b] = ui->mouse_pressed[b] = ui->mouse_released[b] = 0;
     }
-    ui->saved_num_key_events  = ui->num_key_events;
-    ui->saved_num_char_events = ui->num_char_events;
-    ui->num_key_events = ui->num_char_events = 0;
+    s->num_key_events  = ui->num_key_events;
+    s->num_char_events = ui->num_char_events;
+    if (keys) ui->num_key_events = ui->num_char_events = 0;
     // Far off-screen rather than just outside the widget: every hit test in the
     // scope must fail, including the ones that never see the widget's rect.
     ui->mouse_x = ui->mouse_y = -1.0e9f;
     ui->mouse_dx = ui->mouse_dy = 0.0f;
     ui->wheel = 0.0f;
 }
-static void ui_disable_restore_input(UIContext *ui) {
-    ui->mouse_x  = ui->saved_mouse_x;  ui->mouse_y  = ui->saved_mouse_y;
-    ui->mouse_dx = ui->saved_mouse_dx; ui->mouse_dy = ui->saved_mouse_dy;
-    ui->wheel    = ui->saved_wheel;
+static void ui_input_restore(UIContext *ui, const UIInputSnapshot *s, int keys) {
+    ui->mouse_x  = s->mouse_x;  ui->mouse_y  = s->mouse_y;
+    ui->mouse_dx = s->mouse_dx; ui->mouse_dy = s->mouse_dy;
+    ui->wheel    = s->wheel;
     for (int b = 0; b < 3; b++) {
-        ui->mouse_down[b]     = ui->saved_mouse_down[b];
-        ui->mouse_pressed[b]  = ui->saved_mouse_pressed[b];
-        ui->mouse_released[b] = ui->saved_mouse_released[b];
+        ui->mouse_down[b]     = s->mouse_down[b];
+        ui->mouse_pressed[b]  = s->mouse_pressed[b];
+        ui->mouse_released[b] = s->mouse_released[b];
     }
-    ui->num_key_events  = ui->saved_num_key_events;
-    ui->num_char_events = ui->saved_num_char_events;
+    if (keys) {
+        ui->num_key_events  = s->num_key_events;
+        ui->num_char_events = s->num_char_events;
+    }
 }
 
 void ui_disable_next(UIContext *ui) { ui->disable_next = true; }
@@ -273,11 +276,11 @@ void ui_disable_next(UIContext *ui) { ui->disable_next = true; }
 void ui_begin_disabled(UIContext *ui) {
     // Only the outermost scope parks the input -- an inner one would "save" the
     // already-blanked state and restore that on the way out.
-    if (ui->disabled_depth++ == 0) ui_disable_park_input(ui);
+    if (ui->disabled_depth++ == 0) ui_input_park(ui, &ui->disabled_parked, 1);
 }
 void ui_end_disabled(UIContext *ui) {
     if (ui->disabled_depth <= 0) return; // unbalanced end; nothing to restore
-    if (--ui->disabled_depth == 0) ui_disable_restore_input(ui);
+    if (--ui->disabled_depth == 0) ui_input_restore(ui, &ui->disabled_parked, 1);
 }
 int ui_is_disabled(UIContext *ui) { return ui->disabled_depth > 0; }
 
@@ -331,6 +334,12 @@ void ui_resize(UIContext *ui, int cols, int rows) {
     if (cols == ui->cols && rows == ui->rows) return;
     ui->sys->free(ui->screen);
     ui->screen = (OutputCell *)ui->sys->malloc(sizeof(OutputCell) * cols * rows);
+    // Reallocated on next use. The popup stays open, but its rect was measured
+    // on the old grid: parking input against it would block the wrong cells.
+    if (ui->popup_layer) ui->sys->free(ui->popup_layer);
+    ui->popup_layer = (OutputCell *)0;
+    ui->popup.rect_valid = 0;
+    ui->popup.layer_used = 0;
     ui->cols = cols;
     ui->rows = rows;
     ui_clip_reset(ui);
@@ -341,6 +350,7 @@ void ui_destroy(UIContext *ui) {
     Tsys *sys = ui->sys;
     array_free(&ui->components, sys);
     array_free(&ui->overlay_components, sys);
+    if (ui->popup_layer) sys->free(ui->popup_layer);
     sys->free(ui->screen);
     sys->free(ui);
 }
@@ -470,6 +480,10 @@ void ui_advance(UIContext *ui, float x, float y, float w, float h) {
     ui->last_x = x; ui->last_y = y; ui->last_w = w; ui->last_h = h;
     ui->pen_x = ui->line_start_x;
     ui->pen_y = y + h;
+    if (ui->in_popup_body) {
+        if (x + w > ui->popup.extent_x) ui->popup.extent_x = x + w;
+        if (y + h > ui->popup.extent_y) ui->popup.extent_y = y + h;
+    }
 }
 
 void ui_same_line(UIContext *ui) {
@@ -482,6 +496,12 @@ void ui_push_item_width(UIContext *ui, float w) {
 }
 void ui_pop_item_width(UIContext *ui) {
     if (ui->item_width_sp > 0) ui->item_width_sp--;
+}
+void ui_push_label_width(UIContext *ui, int chars) {
+    if (ui->label_width_sp < 16) ui->label_width_stack[ui->label_width_sp++] = chars;
+}
+void ui_pop_label_width(UIContext *ui) {
+    if (ui->label_width_sp > 0) ui->label_width_sp--;
 }
 
 void ui_set_cursor(UIContext *ui, float x, float y) {
@@ -555,8 +575,10 @@ static void ui_push_id_num(UIContext *ui, unsigned int value) {
 }
 
 void ui_push_id(UIContext *ui, const char *str) {
-    if (ui->id_stack_sp < 8)
-        ui->id_stack[ui->id_stack_sp++] = ui_make_id(ui, str);
+    if (ui->id_stack_sp >= 8) return;
+    // Hashed before the push: in one expression the seed read and the sp++ are unsequenced.
+    unsigned int id = ui_make_id(ui, str);
+    ui->id_stack[ui->id_stack_sp++] = id;
 }
 void ui_push_id_ptr(UIContext *ui, const void *ptr) {
     unsigned int seed = ui->id_stack_sp > 0 ? ui->id_stack[ui->id_stack_sp - 1] : 0;
@@ -671,7 +693,8 @@ static unsigned int ui_popup_row_color(UIContext *ui, int selected, int hovered)
 static int ui_button_core(UIContext *ui, const char *text, int disp_len,
                           unsigned int id, int on, int flags) {
     int disabled = ui_item_disable_begin(ui);
-    float autow = (float)disp_len + 2.0f;
+    const int no_margin = (flags & UI_OPTION_NO_MARGIN) != 0;
+    float autow = (float)disp_len + (no_margin ? 0.0f : 2.0f);
     float w = ui_take_width(ui, autow);
     float x = ui->pen_x, y = ui->pen_y, h = 1.0f;
     int iw = (int)w;
@@ -700,7 +723,8 @@ static int ui_button_core(UIContext *ui, const char *text, int disp_len,
     // sub-cell offset as the background fill below, instead of snapping the
     // text back onto the cell grid while the button body moves.
     int pad = (flags & UI_OPTION_ALIGN_LEFT) ? 1 : (iw - disp_len) / 2;
-    if (pad < 1) pad = 1;
+    if (no_margin) pad = 0;
+    else if (pad < 1) pad = 1;
     float tx = x + (float)pad;
     ui_draw_text(ui, tx,  y, text, col);
     ui_fill_rect(ui, x, y, iw, 1, ' ', col); // fill padding around already-drawn text
@@ -714,6 +738,11 @@ int ui_button(UIContext *ui, const char *text) {
     unsigned int id;
     int len = ui_label_and_id(ui, text, &id);
     return ui_button_core(ui, text, len, id, 0, 0);
+}
+int ui_button_flags(UIContext *ui, const char *text, int flags) {
+    unsigned int id;
+    int len = ui_label_and_id(ui, text, &id);
+    return ui_button_core(ui, text, len, id, 0, flags);
 }
 
 int ui_toggle_button_flags(UIContext *ui, const char *text, bool on, int flags) {
@@ -910,7 +939,9 @@ int ui_draggable_value(UIContext *ui, const char *text, float *value, float min,
     }
     else
     {
-        label_w = flags & UI_DRAGGABLE_HIDE_NAME ? 0 : (int)s_strlen(text) + 1;
+        label_w = flags & UI_DRAGGABLE_HIDE_NAME ? 0
+                : ui->label_width_sp > 0 ? ui->label_width_stack[ui->label_width_sp - 1]
+                : (int)s_strlen(text) + 1;
         track_w = iw - label_w - value_w;
         if (track_w < 3) { track_w = 3; label_w = iw - value_w - track_w; if (label_w < 0) label_w = 0; }
         track_x += label_w;
@@ -950,7 +981,9 @@ int ui_draggable_value(UIContext *ui, const char *text, float *value, float min,
     // label 
     if(label_w > 0) {
         char lbl[64];
-        s_strncpy(lbl, text, (size_t)(label_w > 0 ? label_w : 1));
+        int n = label_w < 63 ? label_w : 63;
+        s_strncpy(lbl, text, (size_t)n);
+        lbl[n] = 0;
         ui_draw_text(ui, x, y, lbl, ui_theme_color(ui, UI_COL_LABEL));
     }
 
@@ -1476,8 +1509,14 @@ static void ui_process_components_internal(UIContext *ui, Array *arr, int is_ove
                 for (int cc = 0; cc < iw; cc++)
                     ui_screen_set_cell(ui, iix + cc, iiy + r, ' ',
                         ui_theme_color(ui, UI_COL_DEFAULT));
+            // value.i: side margin outside the item rows, claimed since no item covers it
+            int m = c->value.i;
+            for (int r = 0; r < ih && m; r++) {
+                ui_draw_cell(ui, (float)(iix - 1), (float)(iiy + r), ' ', ui_theme_color(ui, UI_COL_DEFAULT));
+                ui_draw_cell(ui, (float)(iix + iw), (float)(iiy + r), ' ', ui_theme_color(ui, UI_COL_DEFAULT));
+            }
             // consume input for the whole popup area
-            if (ui_hit_raw(ui, c->x, c->y, c->w, c->h))
+            if (ui_hit_raw(ui, c->x - (float)m, c->y, c->w + 2.0f * (float)m, c->h))
                 ui->overlay_consumed_input = 1;
             break;
         }
@@ -1566,11 +1605,500 @@ static void ui_process_components_internal(UIContext *ui, Array *arr, int is_ove
     }
 }
 
+// ===== ui_popup_begin popups =====
+
+#define UI_POPUP_BG_LIFT 12 // one step up the background ramp
+
+static int ui_round(float v) { return v >= 0.0f ? (int)(v + 0.5f) : -(int)(0.5f - v); }
+
+static int ui_in_rect(float px, float py, float x, float y, float w, float h) {
+    return px >= x && px < x + w && py >= y && py < y + h;
+}
+
+static void ui_popup_open_id(UIContext *ui, unsigned int id) {
+    UIPopup *p = &ui->popup;
+    // Outside the body the input may be parked; the spawn point is the real mouse.
+    int parked = ui->popup_input_parked && !ui->in_popup_body;
+    float mx = parked ? ui->popup_parked.mouse_x : ui->mouse_x;
+    float my = parked ? ui->popup_parked.mouse_y : ui->mouse_y;
+    p->id                = id;
+    p->rect_valid        = 0;
+    p->anchored          = 0;
+    p->owns_capture      = 0;
+    p->layer_used        = 0;
+    p->opened_this_frame = 1;
+    p->ctrl_edited       = 0;
+    p->checkbox_view     = 0;
+    p->spawn_x = mx;
+    p->spawn_y = my;
+    ui->popup_open_id = 0; // a legacy dropdown / context popup
+}
+
+void ui_popup_open(UIContext *ui, const char *str_id) {
+    ui_popup_open_id(ui, ui_make_id(ui, str_id));
+}
+
+void ui_popup_open_at(UIContext *ui, const char *str_id, float x, float y) {
+    ui_popup_open_id(ui, ui_make_id(ui, str_id));
+    ui->popup.spawn_x = x;
+    ui->popup.spawn_y = y;
+}
+
+void ui_popup_open_below_last(UIContext *ui, const char *str_id) {
+    ui_popup_open_id(ui, ui_make_id(ui, str_id));
+    UIPopup *p = &ui->popup;
+    p->anchored = 1;
+    p->anchor_x = ui->last_x; p->anchor_y = ui->last_y;
+    p->anchor_w = ui->last_w; p->anchor_h = ui->last_h;
+}
+
+void ui_popup_close(UIContext *ui) {
+    UIPopup *p = &ui->popup;
+    p->id           = 0;
+    p->rect_valid   = 0;
+    p->owns_capture = 0;
+    p->layer_used   = 0;
+}
+
+int ui_popup_is_open(UIContext *ui, const char *str_id) {
+    return ui->popup.id != 0 && ui->popup.id == ui_make_id(ui, str_id);
+}
+
+int ui_popup_any_open(UIContext *ui) {
+    return ui->popup.id != 0 || ui->popup_open_id != 0;
+}
+
+// Centred below the anchor (above it when there is no room below), or at the
+// spawn point, then pushed back inside the screen.
+// Cells between the popup's edge and its content on each side. An anchored
+// unbordered popup has none: it is exactly as wide as its rows.
+static int ui_popup_pad(const UIPopup *p) {
+    int border = (p->flags & UI_POPUP_BORDER) != 0;
+    return border + ((p->anchored && !border) ? 0 : 1);
+}
+
+static void ui_popup_place(UIContext *ui, int w, int h, int *out_x, int *out_y) {
+    UIPopup *p = &ui->popup;
+    int x, y;
+    if (p->anchored) {
+        int pad = ui_popup_pad(p);
+        x = (p->flags & UI_POPUP_ALIGN_LEFT) ? ui_round(p->anchor_x) - pad : ui_round(p->anchor_x + (p->anchor_w - (float)w) * 0.5f);
+        y = ui_round(p->anchor_y + p->anchor_h);
+        int above = ui_round(p->anchor_y) - h;
+        if (y + h > ui->rows && above >= 0) y = above;
+    } else {
+        x = (int)p->spawn_x;
+        y = (int)p->spawn_y;
+    }
+    if (x + w > ui->cols) x = ui->cols - w;
+    if (y + h > ui->rows) y = ui->rows - h;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    *out_x = x; *out_y = y;
+}
+
+static void ui_popup_frame_begin(UIContext *ui) {
+    UIPopup *p = &ui->popup;
+    ui->popup_press_outside = 0;
+    ui->popup_input_parked  = 0;
+    p->begun_this_frame = 0;
+    p->layer_used = 0;
+    if (!p->id) return;
+
+    for (int i = 0; i < ui->num_key_events; i++) {
+        if (ui->key_events[i] != UI_KEY_ESCAPE) continue;
+        int tail = ui->num_key_events - i - 1;
+        ui_memmove(&ui->key_events[i], &ui->key_events[i + 1], tail * (int)sizeof(int));
+        ui_memmove(&ui->key_flags[i],  &ui->key_flags[i + 1],  tail * (int)sizeof(int));
+        ui->num_key_events--;
+        ui_popup_close(ui);
+        return;
+    }
+
+    int over = p->rect_valid &&
+        ui_in_rect(ui->mouse_x, ui->mouse_y, (float)p->x, (float)p->y, (float)p->w, (float)p->h);
+    int on_anchor = p->anchored &&
+        ui_in_rect(ui->mouse_x, ui->mouse_y, p->anchor_x, p->anchor_y, p->anchor_w, p->anchor_h);
+    if (!over && !on_anchor &&
+        (ui->mouse_pressed[0] || ui->mouse_pressed[1] || ui->mouse_pressed[2]))
+        ui->popup_press_outside = 1;
+
+    // A drag held by a widget outside the popup keeps its input, even while
+    // the mouse passes over the popup.
+    if (ui->active_id == 0) p->owns_capture = 0;
+    if (p->owns_capture || (over && ui->active_id == 0)) {
+        int keys = (p->flags & UI_POPUP_CAPTURE_KEYS) != 0;
+        ui_input_park(ui, &ui->popup_parked, keys);
+        ui->popup_input_parked = 1 + keys;
+    }
+}
+
+static void ui_popup_frame_end(UIContext *ui) {
+    UIPopup *p = &ui->popup;
+    if (ui->in_popup_body) ui_popup_end(ui);
+    if (ui->popup_input_parked) {
+        ui_input_restore(ui, &ui->popup_parked, ui->popup_input_parked == 2);
+        ui->popup_input_parked = 0;
+    }
+    // Nobody drew it this frame: whatever owned it is gone.
+    if (p->id && !p->begun_this_frame && !p->opened_this_frame) ui_popup_close(ui);
+
+    if (p->id && p->layer_used && ui->popup_layer) {
+        int c0 = 0, c1 = p->w, r0 = 0, r1 = p->h;
+        if (c0 < -p->src_x) c0 = -p->src_x;
+        if (c0 < -p->x)     c0 = -p->x;
+        if (r0 < -p->src_y) r0 = -p->src_y;
+        if (r0 < -p->y)     r0 = -p->y;
+        if (c1 > ui->cols - p->src_x) c1 = ui->cols - p->src_x;
+        if (c1 > ui->cols - p->x)     c1 = ui->cols - p->x;
+        if (r1 > ui->rows - p->src_y) r1 = ui->rows - p->src_y;
+        if (r1 > ui->rows - p->y)     r1 = ui->rows - p->y;
+        for (int r = r0; r < r1 && c0 < c1; r++)
+            ui_memcpy(&ui->screen[(p->y + r) * ui->cols + p->x + c0],
+                      &ui->popup_layer[(p->src_y + r) * ui->cols + p->src_x + c0],
+                      (c1 - c0) * (int)sizeof(OutputCell));
+    }
+    p->layer_used = 0;
+    p->opened_this_frame = 0;
+}
+
+static int ui_popup_begin_id(UIContext *ui, unsigned int id, float w, float h, int flags) {
+    UIPopup *p = &ui->popup;
+    if (!id || p->id != id || ui->in_popup_body) return 0;
+    if (ui_is_disabled(ui)) { ui_popup_close(ui); return 0; }
+    if (ui->popup_press_outside && !p->opened_this_frame && !(flags & UI_POPUP_STAY_OPEN)) {
+        ui_popup_close(ui);
+        return 0;
+    }
+    int n = ui->cols * ui->rows;
+    if (!ui->popup_layer) {
+        ui->popup_layer = (OutputCell *)ui->sys->malloc(sizeof(OutputCell) * (size_t)n);
+        if (!ui->popup_layer) return 0;
+    }
+    for (int i = 0; i < n; i++) {
+        OutputCell *c = &ui->popup_layer[i];
+        c->ch = ' '; c->color = 0;
+        c->scale = 1.0f; c->weight = 1.0f; c->offset_x = 0.0f; c->offset_y = 0.0f;
+        c->flags = 0;
+    }
+
+    p->begun_this_frame = 1;
+    p->flags = flags;
+    p->req_w = w;
+    p->req_h = h;
+    // Last frame's size, so the body is normally drawn where it will land;
+    // ui_popup_end moves it if the size changed.
+    int pw = p->rect_valid ? p->w : (w > 0.0f ? (int)w : 1);
+    int ph = p->rect_valid ? p->h : (h > 0.0f ? (int)h : 1);
+    ui_popup_place(ui, pw, ph, &p->src_x, &p->src_y);
+
+    UIPopupSaved *s = &ui->popup_saved;
+    s->body_id       = id;
+    s->screen        = ui->screen;
+    s->pen_x         = ui->pen_x;         s->pen_y   = ui->pen_y;
+    s->line_start_x  = ui->line_start_x;  s->content_max_x = ui->content_max_x;
+    s->line_height   = ui->line_height;   s->same_line     = ui->same_line;
+    s->last_x = ui->last_x; s->last_y = ui->last_y; s->last_w = ui->last_w; s->last_h = ui->last_h;
+    s->item_width_sp = ui->item_width_sp;
+    s->label_width_sp = ui->label_width_sp;
+    s->clip_x0 = ui->clip_x0; s->clip_y0 = ui->clip_y0;
+    s->clip_x1 = ui->clip_x1; s->clip_y1 = ui->clip_y1; s->clip_sp = ui->clip_sp;
+    s->id_stack_sp   = ui->id_stack_sp;
+
+    ui->screen = ui->popup_layer;
+    // The header may sit in a clipped panel; the popup is not part of it.
+    ui->clip_x0 = 0; ui->clip_y0 = 0; ui->clip_x1 = ui->cols; ui->clip_y1 = ui->rows;
+    ui->item_width_sp = 0;
+    ui->label_width_sp = 0;
+    if (ui->popup_input_parked) ui_input_restore(ui, &ui->popup_parked, ui->popup_input_parked == 2);
+    // On the opening frame the body is drawn at a guessed position that can
+    // cover the header (a flip above it is only known at ui_popup_end), and
+    // the click that opened it must not land on whatever the guess put there.
+    s->blind = p->opened_this_frame;
+    if (s->blind) ui_input_park(ui, &s->blind_parked, 0);
+    ui_push_id_num(ui, id);
+
+    int border = (flags & UI_POPUP_BORDER) != 0;
+    int pad = ui_popup_pad(p);
+    p->inner_x = (float)(p->src_x + pad);
+    p->inner_y = (float)(p->src_y + border);
+    // Measured width: room to the far side of the screen, so nothing is
+    // squeezed by where the popup happens to be drawn this frame.
+    float inner_w = (w > 0.0f) ? w - 2.0f * pad : (float)ui->cols;
+    ui_set_cursor_column(ui, p->inner_x, p->inner_y, inner_w);
+    ui->same_line   = false;
+    ui->line_height = 0.0f;
+    ui->last_x = p->inner_x; ui->last_y = p->inner_y; ui->last_w = 0.0f; ui->last_h = 0.0f;
+    p->extent_x = p->inner_x;
+    p->extent_y = p->inner_y;
+    p->active_before = ui->active_id;
+    ui->theme_bg_lift = (flags & UI_POPUP_PLAIN_BG) ? 0 : UI_POPUP_BG_LIFT;
+    ui->in_popup_body = 1;
+    return 1;
+}
+
+int ui_popup_begin(UIContext *ui, const char *str_id, float w, float h, int flags) {
+    return ui_popup_begin_id(ui, ui_make_id(ui, str_id), w, h, flags);
+}
+
+static void ui_popup_draw_border(UIContext *ui, int x, int y, int w, int h, unsigned int col) {
+    if (w < 2 || h < 2) return;
+    for (int c = 1; c < w - 1; c++) {
+        ui_draw_cell(ui, (float)(x + c), (float)y,           UI_CHAR_HORIZONTAL_LINE, col);
+        ui_draw_cell(ui, (float)(x + c), (float)(y + h - 1), UI_CHAR_HORIZONTAL_LINE, col);
+    }
+    for (int r = 1; r < h - 1; r++) {
+        //ui_draw_cell(ui, (float)x,           (float)(y + r), UI_CHAR_VERTICAL_LINE, col);
+        //ui_draw_cell(ui, (float)(x + w - 1), (float)(y + r), UI_CHAR_VERTICAL_LINE, col);
+        ui_draw_cell(ui, (float)x,           (float)(y + r), ' ', col);
+        ui_draw_cell(ui, (float)(x + w - 1), (float)(y + r), ' ' , col);
+    }
+    ui_draw_cell(ui, (float)x,           (float)y,           UI_CHAR_ROUND_CORNER_TOP_LEFT,     col);
+    ui_draw_cell(ui, (float)(x + w - 1), (float)y,           UI_CHAR_ROUND_CORNER_TOP_RIGHT,    col);
+    ui_draw_cell(ui, (float)x,           (float)(y + h - 1), UI_CHAR_ROUND_CORNER_BOTTOM_LEFT,  col);
+    ui_draw_cell(ui, (float)(x + w - 1), (float)(y + h - 1), UI_CHAR_ROUND_CORNER_BOTTOM_RIGHT, col);
+}
+
+void ui_popup_end(UIContext *ui) {
+    if (!ui->in_popup_body) return;
+    UIPopup *p = &ui->popup;
+    UIPopupSaved *s = &ui->popup_saved;
+
+    // Closed (or replaced) from inside its own body: nothing to place.
+    if (p->id == s->body_id) {
+        int border = (p->flags & UI_POPUP_BORDER) != 0;
+        int w = (p->req_w > 0.0f) ? (int)p->req_w : (int)(p->extent_x - p->inner_x + 0.999f) + 2 * ui_popup_pad(p);
+        int h = (p->req_h > 0.0f) ? (int)p->req_h : (int)(p->extent_y - p->inner_y + 0.999f) + 2 * border;
+        if (p->anchored && w < ui_round(p->anchor_w)) w = ui_round(p->anchor_w);
+        if (w > ui->cols) w = ui->cols;
+        if (h > ui->rows) h = ui->rows;
+        if (w < 1) w = 1;
+        if (h < 1) h = 1;
+
+        // First-draw-wins: these only reach the cells the body left empty.
+        unsigned int bg = ui_theme_color(ui, UI_COL_DEFAULT);
+        if (border) ui_popup_draw_border(ui, p->src_x, p->src_y, w, h, ui_theme_color(ui, UI_COL_LABEL));
+        ui_fill_rect(ui, (float)p->src_x, (float)p->src_y, w, h, ' ', bg);
+
+        ui_popup_place(ui, w, h, &p->x, &p->y);
+        p->w = w; p->h = h;
+        p->rect_valid = 1;
+        p->layer_used = 1;
+
+        if (ui->active_id == 0)                   p->owns_capture = 0;
+        else if (ui->active_id != p->active_before) p->owns_capture = 1;
+    }
+
+    if (s->blind) ui_input_restore(ui, &s->blind_parked, 0);
+    ui->theme_bg_lift = 0;
+    ui->in_popup_body = 0;
+    ui->screen        = s->screen;
+    ui->pen_x         = s->pen_x;         ui->pen_y   = s->pen_y;
+    ui->line_start_x  = s->line_start_x;  ui->content_max_x = s->content_max_x;
+    ui->line_height   = s->line_height;   ui->same_line     = s->same_line;
+    ui->last_x = s->last_x; ui->last_y = s->last_y; ui->last_w = s->last_w; ui->last_h = s->last_h;
+    ui->item_width_sp = s->item_width_sp;
+    ui->label_width_sp = s->label_width_sp;
+    ui->clip_x0 = s->clip_x0; ui->clip_y0 = s->clip_y0;
+    ui->clip_x1 = s->clip_x1; ui->clip_y1 = s->clip_y1; ui->clip_sp = s->clip_sp;
+    ui->id_stack_sp   = s->id_stack_sp;
+    if (ui->popup_input_parked) ui_input_park(ui, &ui->popup_parked, ui->popup_input_parked == 2);
+}
+
+// The header shared by ui_dropdown_begin and ui_dropdown_panel_begin.
+static void ui_dropdown_header_draw(UIContext *ui, const char *text, int label_len,
+                                    const char *cur_value, int flags,
+                                    float x, float y, float w, int is_open, int hovered) {
+    int iw = (int)w;
+    int has_name = !(flags & UI_DROPDOWN_HIDE_NAME);
+    int has_sel  = !(flags & UI_DROPDOWN_HIDE_SELECTION);
+    int has_tri  = !(flags & UI_DROPDOWN_HIDE_TRIANGLE);
+    int show_sep = has_name && has_sel && !(flags & UI_DROPDOWN_HIDE_SEPARATOR);
+
+    unsigned int col = ui_theme_color(ui, UI_COL_DEFAULT);
+    unsigned int tri_col;
+    if (is_open || hovered) {
+        col = TM_COLOR_PACK(TM_COLOR_FG(ui_theme_color(ui, UI_COL_COLD_ACCENT)),
+                            TM_COLOR_GRADIENT(ui_theme_color(ui, UI_COL_COLD_ACCENT)),
+                            TM_COLOR_BG(ui_theme_color(ui, UI_COL_DIMMED_BG)));
+        tri_col = is_open ? TM_COLOR_FADE_F(col, 0.5f) : col;
+    } else {
+        tri_col = TM_COLOR_FADE_F(col, 0.5f);
+    }
+
+    float cx = x + 1.f;
+    // The name and its ":" are a label, not part of the value -- they take
+    // UI_COL_LABEL while the control rests. Hover/open still recolours the
+    // whole header, so the accent doesn't arrive split in two.
+    unsigned int name_col = (is_open || hovered) ? col : ui_label_color_on(ui, col);
+    // Text stops one cell short of the box when there's a triangle, so the
+    // triangle always has a cell to land in.
+    float header_end = (float)((int)x + iw - (has_tri ? 1 : 0));
+    if (has_name) {
+        for (int k = 0; k < label_len && text[k] && cx < header_end; k++)
+            ui_draw_cell(ui, cx++, y, (unsigned char)text[k], name_col);
+    }
+    if (show_sep && cx < header_end) ui_draw_cell(ui, cx++, y, ':', name_col);
+    if (show_sep && cx < header_end) ui_draw_cell(ui, cx++, y, ' ', name_col);
+    if (has_sel && cur_value) {
+        for (int k = 0; cur_value[k] && cx < header_end; k++)
+            ui_draw_cell(ui, cx++, y, (unsigned char)cur_value[k], col);
+    }
+    if (has_tri) {
+        // Tight against the selection text, not pinned to the right edge: the
+        // triangle belongs to the value it opens, so any slack in the box (a
+        // pushed item width, or the 8-cell minimum) reads as trailing padding
+        // rather than as a gap splitting the header in two.
+        float tri_x = cx;
+        float tri_max = (float)((int)x + iw - 1);
+        if (tri_x > tri_max) tri_x = tri_max;
+        ui_draw_cell(ui, tri_x, y, UI_CHAR_TRIANGLE_DOWN, tri_col);
+    }
+    ui_fill_rect(ui, x, y, iw, 1, ' ', col); // fill padding around already-drawn content
+}
+
+int ui_dropdown_panel_begin(UIContext *ui, const char *text, const char *cur_value,
+                            int header_flags, float w, float h, int popup_flags) {
+    UIPopup *p = &ui->popup;
+    int disabled = ui_item_disable_begin(ui);
+    unsigned int id;
+    int label_len = ui_label_and_id(ui, text, &id);
+    if (disabled && p->id == id) ui_popup_close(ui);
+
+    float x = ui->pen_x, y = ui->pen_y;
+    float hw = ui_take_width(ui, ui_dropdown_autow(text, cur_value, header_flags));
+    int hovered = ui_hit(ui, x, y, hw, 1.0f);
+    if (hovered) ui->hot_id = (int)(id & 0x7fffffff);
+    if (hovered && ui->mouse_pressed[UI_MOUSE_BUTTON_LEFT]) {
+        if (p->id == id) ui_popup_close(ui);
+        else             ui_popup_open_id(ui, id);
+    }
+    int is_open = (p->id == id);
+    if (is_open) {
+        // Every frame, so the popup follows the header if the row moves.
+        p->anchored = 1;
+        p->anchor_x = x; p->anchor_y = y; p->anchor_w = hw; p->anchor_h = 1.0f;
+    }
+    ui_dropdown_header_draw(ui, text, label_len, cur_value, header_flags, x, y, hw, is_open, hovered);
+    ui_advance(ui, x, y, hw, 1.0f);
+    ui_item_disable_end(ui, disabled);
+    return is_open ? ui_popup_begin_id(ui, id, w, h, popup_flags) : 0;
+}
+
+void ui_dropdown_panel_end(UIContext *ui) { ui_popup_end(ui); }
+
+// A plain-dropdown row with its text where a checkbox caption would sit (x+3),
+// so the Ctrl swap to checkboxes moves no text.
+static int ui_multi_dropdown_row(UIContext *ui, const char *text, int selected, float w) {
+    unsigned int uid;
+    ui_label_and_id(ui, text, &uid);
+    int id = (int)uid;
+    float x = ui->pen_x, y = ui->pen_y;
+    int hovered = ui_hit(ui, x, y, w, 1.0f);
+    if (hovered) ui->hot_id = id;
+    if (hovered && ui->mouse_pressed[UI_MOUSE_BUTTON_LEFT]) ui_set_active_control(ui, id, NULL);
+    int clicked = 0;
+    if (ui->active_id == id && ui->mouse_released[UI_MOUSE_BUTTON_LEFT]) {
+        if (ui_hit_raw(ui, x, y, w, 1.0f)) clicked = 1;
+        ui_set_active_control(ui, 0, NULL);
+    }
+    ui_set_last_widget_state(ui, id);
+    unsigned int col = ui_popup_row_color(ui, selected, hovered);
+    ui_draw_text(ui, x + 3.f, y, text, col);
+    ui_fill_rect(ui, x, y, (int)w, 1, ' ', col);
+    ui_advance(ui, x, y, w, 1.0f);
+    return clicked;
+}
+
+int ui_multi_dropdown(UIContext *ui, const char *text, int count, const char *const items[],
+                      bool *values, const char *none_label) {
+    return ui_multi_dropdown_ex(ui, text, count, items, values, none_label, 0, NULL);
+}
+
+int ui_multi_dropdown_ex(UIContext *ui, const char *text, int count, const char *const items[],
+                         bool *values, const char *none_label, int flags, const bool *disabled) {
+    if (count > 31) count = 31;
+    int always = (flags & UI_MULTI_CHECKBOXES) != 0;
+    int nall = 0;
+    for (int i = 0; i < count; i++) nall += values[i] ? 1 : 0;
+    const bool all_on = count > 1 && nall == count;
+    char summary[256];
+    summary[0] = '\0';
+    int sum_len = 0;
+    for (int i = 0; i < count && !all_on; i++) {
+        if (!values[i]) continue;
+        int n = ui_display_len(items[i]);
+        if (sum_len + n + 3 >= (int)sizeof(summary)) break;
+        if (sum_len) { s_strcat(summary, ", "); sum_len += 2; }
+        s_strncpy(summary + sum_len, items[i], (size_t)n + 1);
+        sum_len += n;
+    }
+    const int show_none = !always || none_label;
+    if (!none_label) none_label = "None";
+    if (all_on) s_strncpy(summary, "All", sizeof(summary));
+    else if (!sum_len) s_strncpy(summary, none_label, sizeof(summary));
+
+    int changed = 0;
+    if (!ui_dropdown_panel_begin(ui, text, summary, 0, 0.0f, 0.0f, UI_POPUP_ALIGN_LEFT)) return 0;
+
+    // One row width for both modes, at least the header's, so Ctrl changes
+    // neither the rect nor where any text sits.
+    int maxlen = ui_display_len(none_label);
+    for (int i = 0; i < count; i++) {
+        int n = ui_display_len(items[i]);
+        if (n > maxlen) maxlen = n;
+    }
+    float row_w = (float)(maxlen + 4);
+    if (row_w < ui->popup.anchor_w) row_w = ui->popup.anchor_w;
+
+    int nsel = 0;
+    for (int i = 0; i < count; i++) nsel += values[i] ? 1 : 0;
+    // Latched at opening, so unticking down to one item does not swap the view.
+    if (ui->popup.opened_this_frame) ui->popup.checkbox_view = nsel > 1;
+
+    float x0 = ui->pen_x;
+    int ctrl = (ui->mouse_flags & UI_FLAGS_CTRL) != 0;
+    if (!always && !ctrl && ui->popup.ctrl_edited) {
+        // Ctrl released after editing with it: the edit is done.
+        ui_popup_close(ui);
+    } else if (always || ctrl || ui->popup.checkbox_view) {
+        int by_ctrl = !always && !ui->popup.checkbox_view;
+        for (int i = 0; i < count; i++) {
+            int off = disabled && disabled[i];
+            if (off) ui_begin_disabled(ui);
+            if (ui_check_box(ui, items[i], &values[i])) changed |= 1 << i;
+            if (off) ui_end_disabled(ui);
+        }
+        ui->pen_x = x0 + 2.0f;
+        if (show_none && ui_button(ui, none_label)) {
+            for (int i = 0; i < count; i++)
+                if (values[i]) { values[i] = false; changed |= 1 << i; }
+            if (!ctrl) ui->popup.checkbox_view = 0;
+        }
+        if (changed && by_ctrl) ui->popup.ctrl_edited = 1;
+    } else {
+        int pick = -2;
+        for (int i = 0; i < count; i++)
+            if (ui_multi_dropdown_row(ui, items[i], values[i], row_w)) pick = i;
+        if (ui_multi_dropdown_row(ui, none_label, nsel == 0, row_w)) pick = -1;
+        if (pick != -2) {
+            for (int i = 0; i < count; i++) {
+                bool on = (i == pick);
+                if (values[i] != on) { values[i] = on; changed |= 1 << i; }
+            }
+            ui_popup_close(ui);
+        }
+    }
+    ui_dropdown_panel_end(ui);
+    return changed;
+}
+
 void ui_begin(UIContext *ui, float time_in_seconds) {
     ui->time = time_in_seconds;
     ui->mouse_dx = ui->mouse_x - ui->prev_mouse_x;
     ui->mouse_dy = ui->mouse_y - ui->prev_mouse_y;
     ui->hot_id = 0;
+    ui->wants_escape = 0;
     ui->last_widget_activated = 0;
     ui->last_widget_active = 0;
     ui->last_widget_deactivated = 0;
@@ -1608,6 +2136,8 @@ void ui_begin(UIContext *ui, float time_in_seconds) {
     // reset popup-building state for this frame
     ui->in_popup = 0;
     ui->popup_bg_component_idx = -1;
+
+    ui_popup_frame_begin(ui);
 }
 
 int ui_update_dynamic(UIContext *ui) {
@@ -1621,6 +2151,9 @@ void ui_end(UIContext *ui) {
     // to come back before the bookkeeping below latches prev_mouse_* from it.
     while (ui->disabled_depth > 0) ui_end_disabled(ui);
     ui->disable_next = false;
+    // Same for the input parked around a popup: a held check box inside it
+    // would otherwise read as released and lose its capture just below.
+    ui_popup_frame_end(ui);
 
     // fix active_id when a control is removed while dragging
     if (ui->active_id != 0 && !ui->mouse_down[ui->active_button]) {
@@ -1648,6 +2181,7 @@ void ui_open_popup(UIContext *ui, const char *str_id) {
     ui->popup_open_id  = (ui->popup_open_id == id) ? 0 : id;
     ui->popup_spawn_x  = ui->mouse_x;
     ui->popup_spawn_y  = ui->mouse_y;
+    if (ui->popup_open_id) ui_popup_close(ui);
 }
 
 int ui_context_popup_begin(UIContext *ui, const char *str_id) {
@@ -1695,13 +2229,7 @@ int ui_dropdown_begin(UIContext *ui, const char *text, const char *cur_value, in
 
     float x = ui->pen_x, y = ui->pen_y;
 
-    int has_name = !(flags & UI_DROPDOWN_HIDE_NAME);
-    int has_sel  = !(flags & UI_DROPDOWN_HIDE_SELECTION);
-    int has_tri  = !(flags & UI_DROPDOWN_HIDE_TRIANGLE);
-    int show_sep = has_name && has_sel && !(flags & UI_DROPDOWN_HIDE_SEPARATOR);
-
     float w = ui_take_width(ui, ui_dropdown_autow(text, cur_value, flags));
-    int iw = (int)w;
 
     int is_open = (ui->popup_open_id == id);
     int hovered = ui_hit(ui, x, y, w, 1.0f);
@@ -1717,51 +2245,10 @@ int ui_dropdown_begin(UIContext *ui, const char *text, const char *cur_value, in
     if (hovered && ui->mouse_pressed[UI_MOUSE_BUTTON_LEFT]) {
         ui->popup_open_id = is_open ? 0 : id;
         is_open = !is_open;
+        if (is_open) ui_popup_close(ui);
     }
 
-    // draw header
-
-    unsigned int col = ui_theme_color(ui, UI_COL_DEFAULT);
-    unsigned int tri_col;
-    if (is_open || hovered) {
-        col = TM_COLOR_PACK(TM_COLOR_FG(ui_theme_color(ui, UI_COL_COLD_ACCENT)),
-                            TM_COLOR_GRADIENT(ui_theme_color(ui, UI_COL_COLD_ACCENT)),
-                            TM_COLOR_BG(ui_theme_color(ui, UI_COL_DIMMED_BG)));
-        tri_col = is_open ? TM_COLOR_FADE_F(col, 0.5f) : col;
-    } else {
-        tri_col = TM_COLOR_FADE_F(col, 0.5f);
-    }
-
-    float cx = x + 1.f;
-    // The name and its ":" are a label, not part of the value -- they take
-    // UI_COL_LABEL while the control rests. Hover/open still recolours the
-    // whole header, so the accent doesn't arrive split in two.
-    unsigned int name_col = (is_open || hovered) ? col : ui_label_color_on(ui, col);
-    // Text stops one cell short of the box when there's a triangle, so the
-    // triangle always has a cell to land in.
-    float header_end = (float)((int)x + iw - (has_tri ? 1 : 0));
-    if (has_name) {
-        for (int k = 0; k < label_len && text[k] && cx < header_end; k++)
-            ui_draw_cell(ui, cx++, y, (unsigned char)text[k], name_col);
-    }
-    if (show_sep && cx < header_end) ui_draw_cell(ui, cx++, y, ':', name_col);
-    if (show_sep && cx < header_end) ui_draw_cell(ui, cx++, y, ' ', name_col);
-    if (has_sel && cur_value) {
-        for (int k = 0; cur_value[k] && cx < header_end; k++)
-            ui_draw_cell(ui, cx++, y, (unsigned char)cur_value[k], col);
-    }
-    if (has_tri) {
-        // Tight against the selection text, not pinned to the right edge: the
-        // triangle belongs to the value it opens, so any slack in the box (a
-        // pushed item width, or the 8-cell minimum) reads as trailing padding
-        // rather than as a gap splitting the header in two.
-        float tri_x = cx;
-        float tri_max = (float)((int)x + iw - 1);
-        if (tri_x > tri_max) tri_x = tri_max;
-        ui_draw_cell(ui, tri_x, y, UI_CHAR_TRIANGLE_DOWN, tri_col);
-    }
-    ui_fill_rect(ui, x, y, iw, 1, ' ', col); // fill padding around already-drawn content
-
+    ui_dropdown_header_draw(ui, text, label_len, cur_value, flags, x, y, w, is_open, hovered);
     ui_advance(ui, x, y, w, 1.0f);
 
     if (is_open) {
@@ -1773,6 +2260,7 @@ int ui_dropdown_begin(UIContext *ui, const char *text, const char *cur_value, in
         UIControl *bgc = ui_add_overlay_control(ui, UI_COMPONENT_POPUP_BG,
                                                  x, y + 1.0f, "");
         bgc->w = w; bgc->h = 0.0f;
+        bgc->value.i = 0;
     }
     // Closed before the caller's ui_selectable() calls run, so the popup body
     // is built (and dimmed) by its own scope, not by the header's.

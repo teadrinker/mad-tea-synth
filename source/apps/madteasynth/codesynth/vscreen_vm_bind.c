@@ -74,6 +74,12 @@ int vscreen_text_align_i32_ctx(void *ctx, int id) {
     return render_ctx_text_align_i32(c, id);
 }
 
+int vscreen_color_ramp_setup_i32_ctx(void *ctx, int add, int bit_offset,
+                                     int low, int mid, int high) {
+    VS_CTX(ctx); if (!c) return 0;
+    return render_ctx_color_ramp_setup_i32(c, add, bit_offset, low, mid, high);
+}
+
 int vscreen_image_alloc_i32_ctx(void *ctx, int w, int h) {
     VS_CTX(ctx); if (!c) return 0;
     return render_ctx_image_alloc_i32(c, w, h);

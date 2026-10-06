@@ -2,11 +2,13 @@
 #ifndef VSCREEN_H_INCLUDED
 #define VSCREEN_H_INCLUDED
 
-// A simulated Pebble Time 2 display (200x228, GColor8 0bAARRGGBB, 8bpp) that
-// bodies draw into. This is the desktop binding of the API documented in
+// An 8bpp palette display (default 200x228, Pebble Time 2) that bodies draw
+// into. This is the desktop binding of the API documented in
 // font/render_ctx.h: it provisions storage and forwards each vscreen_* name to
 // render_ctx_*. Behaviour belongs in font/render_ctx.c or render_lowspec.c.
-// Small literals work as colours: putpixel(x, y, 3) is blue.
+// A byte's meaning is the context's RLayout: GColor8 0bAARRGGBB by default, so
+// small literals work as colours (putpixel(x, y, 3) is blue), until a body
+// calls color_ramp_setup.
 
 // FX16_SHIFT: the primitives' fixed-point format.
 #include "common/math_fixedp.h"
@@ -130,11 +132,13 @@ typedef struct VScreenFontCache {
 
 // Provisions `c` over caller-owned storage with a w x h screen (clamped). All
 // blocks are borrowed for the context's life; the framebuffer must outlive every
-// VM given it. `palette` gets the default cube; 0 leaves none. `font_cache` is
+// VM given it. `palette` gets the default cube; 0 leaves none. `layout` is reset
+// to the GColor8 default; 0 leaves the screen 8-bit gray. `font_cache` is
 // per-context, since drawing fills it. The screen is not cleared.
 void vscreen_ctx_provision(RenderCtx *c,
                            unsigned char *pixels, int w, int h,
                            int *palette, int palette_len,
+                           RLayout *layout,
                            char *scratch, int scratch_bytes,
                            char *image_arena, int image_arena_bytes,
                            RenderImage *images, int image_cap,
@@ -195,6 +199,7 @@ void   vscreen_text(int x, int y, int size, int stroke_width,
                     const unsigned char *str, int len, int alpha, int blend, int letter_spacing, int line_height);
 int    vscreen_font_i32(int id);
 int    vscreen_text_align_i32(int id);
+int    vscreen_color_ramp_setup_i32(int add, int bit_offset, int low, int mid, int high);
 
 // ---- off-screen image targets ----
 int    vscreen_image_alloc_i32(int w, int h);

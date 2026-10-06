@@ -132,6 +132,13 @@
 #define RB_DITHER 0
 #endif
 
+// Runtime pixel layouts (RSurface::layout, common/render_layout.h): every
+// unified build except RS_PEBBLE_TIME2, which keeps its compile-time GColor8
+// path. A NULL or (0,0,8) layout is gray8 and takes the gray arms unchanged.
+#define RB_LAYOUTS (USE_UNIFIED_BLEND && !RS_PEBBLE_TIME2)
+
+#include "common/render_layout.h"
+
 // ===================================================================
 // Quantization, and why it is a multiply rather than a shift.
 //
@@ -220,6 +227,14 @@ typedef struct {
                                  // for Tier B's per-channel targets
     unsigned char mask, nmask;   // channel write mask; nmask == ~mask
     unsigned char gray8;         // destination is 8-bit gray
+#if RB_LAYOUTS
+    // A runtime layout, when !gray8 (see rb_make_l).
+    const RLayout *lay;
+    const unsigned char *dec8;   // the source channel's byte -> 0..255
+    const unsigned char *enc8;   // 0..255 -> byte
+    short colc[RLAYOUT_MAX_CH];  // per-channel target 0..255, Tier B
+    unsigned char locked;        // bit ch: channel ch is locked
+#endif
 } RBlend;
 
 // Coverage multiplier as 0..255 from a Q16.16 alpha, clamped.
@@ -230,7 +245,7 @@ static inline int rb_alpha8(int alpha_fx) {
 }
 
 // Resolve a draw. `blend` is the usual packed int (mode bits -- BLEND_INVERT,
-// BLEND_LOCK_R/G/B -- plus BLEND_8BIT_GRAYSCALE and any BLEND_CHANNEL mask);
+// BLEND_LOCK_* -- plus BLEND_8BIT_GRAYSCALE);
 // `col` is the destination-encoded target colour byte,
 // which for every coverage-style caller is "white" and can be passed as -1 to
 // mean exactly that. `alpha_fx` is Q16.16, literal (0 draws nothing).
@@ -328,6 +343,73 @@ RB_HOT unsigned char rb_px_gray(const RBlend *b, unsigned int cur, int cov) {
     return (unsigned char)(((unsigned)v & b->mask) | (cur & b->nmask));
 }
 
+#if RB_LAYOUTS
+// rb_make for a destination with a runtime layout. A NULL or (0,0,8) layout,
+// or BLEND_8BIT_GRAYSCALE, resolves exactly as rb_make, flagged gray8.
+static inline RBlend rb_make_l(int blend, int col, int alpha_fx, const RLayout *lay) {
+    RBlend b = rb_make(blend, col, alpha_fx);
+    int flags = rs_blend_flags(blend);
+    int ch, src = 0, locked = 0, keep;
+    b.lay = 0;
+    if (!lay || lay->gray8 || rs_blend_gray8(blend)) {
+        b.gray8 = 1;
+        return b;
+    }
+    keep = rlayout_locked_bits(lay, flags);
+    if (lay->nch > 1)
+        for (ch = 0; ch < lay->nch; ch++)
+            if (flags & (BLEND_LOCK_CH0 << ch)) locked |= 1 << ch;
+    while (src < lay->nch - 1 && ((locked >> src) & 1)) src++;
+    b.gray8   = 0;
+    b.lay     = lay;
+    b.dec8    = lay->dec8[src];
+    b.enc8    = lay->enc8;
+    b.locked  = (unsigned char)locked;
+    b.mask    = (unsigned char)(~keep & 0xFF);
+    b.nmask   = (unsigned char)keep;
+    b.col_eff = (short)(rs_blend_inverted(blend) ? 255 : (col < 0 ? 255 : b.dec8[col & 0xFF]));
+    for (ch = 0; ch < RLAYOUT_MAX_CH; ch++)
+        b.colc[ch] = (short)(col < 0 ? 255 : lay->dec8[ch][col & 0xFF]);
+    return b;
+}
+
+// Tier A on a runtime layout: rb_px_gray between two byte loads. Like rb_px it
+// reads one channel (the lowest unlocked) and writes that gray to all of them.
+RB_HOT unsigned char rb_px_ramp(const RBlend *b, unsigned int cur, int cov) {
+    int d = b->dec8[cur];
+    int a = (b->alpha8 == 255) ? cov : (cov * b->alpha8) / 255;
+    int v = d + ((b->col_eff - b->k * d) * a) / 255;
+    if (v < 0) v = 0; else if (v > 255) v = 255;
+    return (unsigned char)((b->enc8[v] & b->mask) | (cur & b->nmask));
+}
+
+// One byte blended per channel on a runtime layout: what a Tier B table holds,
+// and what render_convex.h's fringe evaluates inline so core and fringe agree.
+// `a` is the draw's whole 0..255 coverage, alpha folded in.
+static inline unsigned char rb_px_chan(const RBlend *b, unsigned int cur, int a) {
+    const RLayout *l = b->lay;
+    int ch, p = 0;
+    for (ch = 0; ch < l->nch; ch++) {
+        int lmax = (1 << l->bits[ch]) - 1;
+        int d = l->dec8[ch][cur & 0xFF];
+        int v = d;
+        if (!((b->locked >> ch) & 1)) {
+            int reach = (b->k == 2) ? (255 - 2 * d) : (b->colc[ch] - d);
+            v = d + (reach * a) / 255;
+            if (v < 0) v = 0; else if (v > 255) v = 255;
+        }
+        p |= ((v * lmax + 127) / 255) << l->pshift[ch];
+    }
+    return (unsigned char)(l->add + (p << l->off));
+}
+
+#define RB_MAKE(surf, blend, col, alpha) rb_make_l((blend), (col), (alpha), (surf)->layout)
+#define RB_PX_A(b, cur, cov, x, y) rb_px_ramp((b), (cur), (cov))
+#else
+#define RB_MAKE(surf, blend, col, alpha) rb_make((blend), (col), (alpha))
+#define RB_PX_A(b, cur, cov, x, y) rb_px((b), (cur), (cov), RB_DITHER_AT((x), (y)))
+#endif
+
 // ===================================================================
 // Tier B -- constant coverage, so the whole blend is a table.
 // ===================================================================
@@ -367,17 +449,26 @@ static const unsigned short rb_bayer2[4] = { 8192, 40960, 57344, 24576 };
 #define RB_LUT_DITHER_AT(x, y) RB_Q3_ROUND
 #endif
 
+// GColor8 indexes 64 states by the low 6 bits; a runtime layout indexes up to
+// 256 by `idx` (RLayout::lut_mask), undithered.
+#if RB_LAYOUTS
+typedef struct {
+    unsigned char t[1][256];
+    unsigned char idx;
+} RBlendLut;
+#define RB_LUT_AT(lut, x, y, px) ((lut)->t[0][(px) & (lut)->idx])
+#else
 typedef struct {
     unsigned char t[RB_LUT_PHASES][64];
 } RBlendLut;
+#define RB_LUT_AT(lut, x, y, px) ((lut)->t[RB_LUT_PHASE((x), (y))][(px) & 0x3F])
+#endif
 
 // Is there a Tier B table at all in this TU? Off the unified path there is no
-// rb_lut_make to call, and on an 8-bit gray destination there are 256 states
-// rather than 64 -- too many to be worth tabulating per draw (see rb_lut_get).
-// Both call sites and RBlendCache below key off this rather than repeating the
-// pair, which is also what keeps the cache from costing a byte in a build that
-// could never index it.
-#if USE_UNIFIED_BLEND && RS_PEBBLE_TIME2
+// rb_lut_make to call. On an 8-bit gray destination (and in a build with no
+// runtime layouts, every destination) rb_lut_get returns 0 instead: 256 states
+// cost more to tabulate per draw than most draws cost to fill.
+#if USE_UNIFIED_BLEND && (RS_PEBBLE_TIME2 || RB_LAYOUTS)
 #define RB_LUT_ENABLED 1
 #else
 #define RB_LUT_ENABLED 0
@@ -483,6 +574,9 @@ typedef struct RBlendCache {
 #if RB_LUT_ENABLED
     RBlendLut lut;
     int  key_blend, key_col, key_cov;
+#if RB_LAYOUTS
+    int  key_lay;
+#endif
     unsigned char valid;
 #if RB_CACHE_STATS
     unsigned long hits, misses;
@@ -532,7 +626,7 @@ static inline void rb_cache_reset(RBlendCache *c) {
 // put one on their stack; it is 12 bytes more than the bare RBlendLut they
 // already had there.
 static inline const RBlendLut *rb_lut_get(RBlendCache *c, int blend, int col, int cov) {
-#if RB_LUT_ENABLED
+#if RB_LUT_ENABLED && !RB_LAYOUTS
     if (rs_blend_mode(blend) & BLEND_REPLACE) return 0;
     if (rs_blend_gray8(blend))                return 0;
 
@@ -559,5 +653,44 @@ static inline const RBlendLut *rb_lut_get(RBlendCache *c, int blend, int col, in
     return 0;
 #endif
 }
+
+#if RB_LAYOUTS
+// rb_lut_make for a runtime layout: lut_mask + 1 entries of rb_px_chan.
+static inline void rb_lut_make_l(RBlendLut *lut, const RBlend *b, int cov) {
+    int a = (b->alpha8 == 255) ? cov : (cov * b->alpha8) / 255;
+    int n = b->lay->lut_mask, i;
+    for (i = 0; i <= n; i++) lut->t[0][i] = rb_px_chan(b, (unsigned)i, a);
+    lut->idx = (unsigned char)n;
+}
+
+// rb_lut_get for a runtime layout; 0 (take the gray arm) for a NULL or
+// (0,0,8) layout. The layout's key completes the cache key.
+static inline const RBlendLut *rb_lut_get_l(RBlendCache *c, int blend, int col, int cov,
+                                            const RLayout *lay) {
+    if (rs_blend_mode(blend) & BLEND_REPLACE) return 0;
+    if (!lay || lay->gray8 || rs_blend_gray8(blend)) return 0;
+    if (c->valid && c->key_blend == blend && c->key_col == col && c->key_cov == cov &&
+        c->key_lay == lay->key) {
+#if RB_CACHE_STATS
+        c->hits++;
+#endif
+        return &c->lut;
+    }
+#if RB_CACHE_STATS
+    c->misses++;
+#endif
+    {
+        RBlend rb = rb_make_l(blend, col, 65536, lay);
+        rb_lut_make_l(&c->lut, &rb, cov);
+    }
+    c->key_blend = blend; c->key_col = col; c->key_cov = cov; c->key_lay = lay->key;
+    c->valid = 1;
+    return &c->lut;
+}
+
+#define RB_LUT_GET(c, surf, blend, col, cov) rb_lut_get_l((c), (blend), (col), (cov), (surf)->layout)
+#else
+#define RB_LUT_GET(c, surf, blend, col, cov) rb_lut_get((c), (blend), (col), (cov))
+#endif
 
 #endif // RENDER_BLEND_H

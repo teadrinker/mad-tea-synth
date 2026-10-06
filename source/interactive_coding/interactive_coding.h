@@ -159,11 +159,91 @@
 
     void interactive_coding_set_hover_inspect(InteractiveCoding *ic, bool on);
 
+    // The editing aids: the remaining parameters of a call after a typed comma
+    // or `(`, the parameter names around a hovered comma, and Tab completion of
+    // a name from locals, globals and built-ins. On by default.
+    void interactive_coding_set_completion(InteractiveCoding *ic, bool on);
+
+    // The Hint box: show the single completion Tab would write, as you type.
+    // Per-keypress work, so a host that cannot afford it turns it off. On by default.
+    void interactive_coding_set_hints(InteractiveCoding *ic, bool on);
+
     void interactive_coding_set_inspect_available(InteractiveCoding *ic, bool available);
     void interactive_coding_invalidate_inspection(InteractiveCoding *ic);
     int interactive_coding_strip_inspections(InteractiveCoding *ic);
 
     void interactive_coding_set_freeform_prelude(InteractiveCoding *ic, const char *prelude);
+
+    // ---- Host-run mode ------------------------------------------------------
+    // IC_RUN_LOCAL (the default): the editor compiles and runs the buffer itself
+    // and inspects it with private instrumented runs.
+    //
+    // IC_RUN_HOST: the editor runs nothing. Every edit that parses is handed to
+    // the code-changed callbacks (not only edits that compile, since the editor
+    // can no longer tell), stamped with a code serial. What to inspect is handed
+    // out as a probe set (on_probes_changed / get_probes), and the host feeds
+    // back results, errors, print() output and inspection passes through the
+    // host_* and inspect_* calls below, all on the UI thread.
+    typedef enum { IC_RUN_LOCAL = 0, IC_RUN_HOST } ICRunMode;
+    void interactive_coding_set_run_mode(InteractiveCoding *ic, ICRunMode mode);
+    ICRunMode interactive_coding_get_run_mode(InteractiveCoding *ic);
+
+    // Host mode only: still parse AND compile each edit locally, without
+    // running it, for instant compile errors and the Show C/JS/Lua output while
+    // the host catches up. Off: only parse errors are local. A local parse or
+    // compile error is shown ahead of anything the host reports.
+    void interactive_coding_set_local_check(InteractiveCoding *ic, bool on);
+
+    // The code-changed callback with the serial the host echoes back in
+    // host_begin. Fires alongside the plain one.
+    typedef void (*InteractiveCodingCodeChanged2Fn)(const char *body, unsigned code_serial, void *user);
+    void interactive_coding_set_code_changed_callback2(
+        InteractiveCoding *ic, InteractiveCodingCodeChanged2Fn cb, void *user);
+
+    // One thing to inspect. `lo`/`hi` are a BYTE span of the editor's own text
+    // (no wrap, no prelude): a host offsets them into the source it compiles
+    // and finds the node with vm_probe_node_for_span. `is_sig` marks a lambda
+    // parameter list, which wants the function's signatures (inspect_sigs)
+    // rather than values.
+    typedef struct ICProbe { int id; size_t lo, hi; int is_sig; } ICProbe;
+    #define IC_PROBES_MAX 16
+
+    // Fired whenever the probe set changes, with the serial a pass must quote.
+    // The serial only moves when a span or an id actually changes, so a host a
+    // few edits behind keeps landing passes while the spans still hold. An empty
+    // set means stop inspecting. `probes` is valid only for the call.
+    typedef void (*InteractiveCodingProbesChangedFn)(const ICProbe *probes, int n, unsigned code_serial,
+                                                     unsigned probe_serial, void *user);
+    void interactive_coding_set_probes_changed_callback(
+        InteractiveCoding *ic, InteractiveCodingProbesChangedFn cb, void *user);
+    // The current set; returns the count (at most `max` written).
+    int  interactive_coding_get_probes(InteractiveCoding *ic, ICProbe *out, int max,
+                                       unsigned *probe_serial);
+
+    // Results for the body the host was handed under `code_serial`, applied to
+    // the active editor. A block for a serial older than the newest one already
+    // shown is dropped. Between begin and end: any number of errors (row/col in
+    // the editor's own text, -1 when unknown), at most one result line, and
+    // print() output in call order.
+    enum { IC_HOST_PARSE = 0, IC_HOST_COMPILE, IC_HOST_RUN };
+    void interactive_coding_host_begin (InteractiveCoding *ic, unsigned code_serial);
+    void interactive_coding_host_error (InteractiveCoding *ic, int stage, int row, int col, const char *msg);
+    void interactive_coding_host_result(InteractiveCoding *ic, const char *text);
+    void interactive_coding_host_print (InteractiveCoding *ic, const unsigned char *s, int n);
+    void interactive_coding_host_end   (InteractiveCoding *ic);
+
+    // One inspection pass: every reading for the probe set `probe_serial`
+    // named, replacing the previous pass. A pass quoting any other probe serial
+    // is dropped whole and the labels on screen stay. Send one only for a run
+    // that happened: a pass with no values reads as "never executed". `kind` /
+    // `fx_shift` / `vals` are exactly what VMInspectFn / VMInspectArrFn receive,
+    // so a host on the UI thread can forward its VM's sinks straight here.
+    void interactive_coding_inspect_begin(InteractiveCoding *ic, unsigned probe_serial);
+    void interactive_coding_inspect_value(InteractiveCoding *ic, int id, int kind, int fx_shift, double v);
+    void interactive_coding_inspect_array(InteractiveCoding *ic, int id, int kind, int fx_shift,
+                                          int total, const double *vals, int n);
+    void interactive_coding_inspect_sigs (InteractiveCoding *ic, int id, const char *labels);
+    void interactive_coding_inspect_end  (InteractiveCoding *ic);
 
 
 #endif // INCLUDE_TEST_VM_EXAMPLE

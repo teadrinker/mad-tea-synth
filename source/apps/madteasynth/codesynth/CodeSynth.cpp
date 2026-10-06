@@ -47,16 +47,27 @@ struct cCodeSynthPipeline
   cCodeSynthReadonly* current = nullptr;
   std::atomic<cCodeSynthReadonly*> update{nullptr};
   std::atomic<cCodeSynthReadonly*> noLongerInUse{nullptr};
+  std::atomic<unsigned> globalsResetRequests{0};
+  unsigned globalsResetsSeen = 0;  // consumer thread only
+  bool handedOver = false;         // producer thread only
 
-  // Swaps in a fresh compile once the previous one was reclaimed.
+  // Swaps in a fresh compile once the previous one was reclaimed. The globals'
+  // running values are carried here, on the thread that writes them.
   bool valid()
   {
     if (noLongerInUse.load() == NULL)
       if (cCodeSynthReadonly* next = update.exchange(NULL))
       {
+        if (current) next->globals.TakeValuesFrom(current->globals);
         noLongerInUse.store(current); // handed back to the UI to free
         current = next;
       }
+    unsigned resets = globalsResetRequests.load();
+    if (resets != globalsResetsSeen)
+    {
+      globalsResetsSeen = resets;
+      if (current) current->globals.RestoreInitValues();
+    }
     return current != NULL;
   }
 
@@ -64,16 +75,30 @@ struct cCodeSynthPipeline
   // only takes ownership via update.exchange(NULL), so what exchange returns
   // here was never seen and is safe to delete.
   void compile(const std::string& content, const std::string& assetDir, bool forVisual,
-               char* debugMsg, int debugMsgMax, RenderCtx* screen)
+               char* debugMsg, int debugMsgMax, RenderCtx* screen,
+               const CodeSynthProbes* probes = nullptr)
   {
     delete noLongerInUse.exchange(NULL);
     cCodeSynthReadonly* f = new cCodeSynthReadonly();
-    if (!CodeSynthParse(content.c_str(), assetDir.c_str(), f, debugMsgMax, debugMsg, screen, forVisual))
+    if (!CodeSynthParse(content.c_str(), assetDir.c_str(), f, debugMsgMax, debugMsg, screen, forVisual, probes))
     {
       delete f;
       return;
     }
+    // Mid-edit globals would drop every running value, so the last good program
+    // keeps playing.
+    if (!f->globals.valid && handedOver)
+    {
+      delete f;
+      if (debugMsg && debugMsgMax > 0)
+      {
+        std::string msg = std::string(debugMsg) + "codesynth: globals do not compile -- still running the previous version\n";
+        snprintf(debugMsg, (size_t)debugMsgMax, "%s", msg.c_str());
+      }
+      return;
+    }
     delete update.exchange(f);
+    handedOver = true;
   }
 
   // Only after valid().
@@ -161,12 +186,16 @@ public:
   // Re-armed only when the entry changes, so edits don't restart the animation.
   int fVisualPreviewStartTime = 0;
 
+  // The synth slots whose visual body ran in the last tick, indexed like synth[].
+  bool fVisualRendered[128] = {};
+
   // This instance's screen and its storage. Members, not the vscreen_* globals,
   // which belong to an exported song. Never reallocated: the framebuffer must
   // outlive every VM that drew into it.
   RenderCtx     fRenderCtx;
   unsigned char fScreenPixels[VSCREEN_MAX_W * VSCREEN_MAX_H];
   int           fPalette[VSCREEN_PALETTE_LEN];
+  RLayout       fLayout;
   char          fGlyphScratch[VSCREEN_GLYPH_SCRATCH_BYTES];
   char          fImageArena[VSCREEN_IMAGE_ARENA_BYTES];
   RenderImage   fImages[VSCREEN_MAX_IMAGES];
@@ -176,6 +205,51 @@ public:
   char             fFontCacheMem[VSCREEN_FONT_CACHE_BYTES];
 
   CodeSynthVmCtx fVisualVmCtx;
+
+  // Inspection, UI thread: the visual editor's probes, compiled into the visual
+  // pipeline; where its readings go; the content last compiled, for a probe
+  // change to recompile the visual half alone; and the pipeline the first-run
+  // report was last made for.
+  CodeSynthProbes fVisualProbes;
+  CodeSynthInspectListener fInspect;
+  std::string fLastContent;
+  const cCodeSynthReadonly* fReportedPipeline = nullptr;
+  bool fInspecting = false;
+  bool fReporting = false;
+  bool fReportOk = true;
+  std::string fReportPrint;
+
+  void setInspectListener(const CodeSynthInspectListener& l) { fInspect = l; }
+
+  void setVisualProbes(const CodeSynthProbes& probes)
+  {
+    fVisualProbes = probes;
+    if (fLastContent.empty()) return;
+    char msg[1024] = {0};
+    fVisual.compile(fLastContent, fAssetDir, true, msg, 1023, &fRenderCtx, &fVisualProbes);
+  }
+
+  // The editor's text moved with no change to the spans: they still hold
+  // against the new text, which the next compile finds the body in.
+  void setVisualProbeBody(const std::string& body) { fVisualProbes.editorBody = body; }
+
+  static void inspectSink(void* user, int id, int kind, int shift, double v)
+  {
+    cCodeSynth* cs = static_cast<cCodeSynth*>(user);
+    if (id >= 0 && cs->fInspecting && cs->fInspect.value) cs->fInspect.value(cs->fInspect.user, id, kind, shift, v);
+  }
+  static void inspectArrSink(void* user, int id, int kind, int shift, int total, const double* vals, int n)
+  {
+    cCodeSynth* cs = static_cast<cCodeSynth*>(user);
+    if (id >= 0 && cs->fInspecting && cs->fInspect.array) cs->fInspect.array(cs->fInspect.user, id, kind, shift, total, vals, n);
+  }
+  static void reportPrint(void* user, const unsigned char* s, int n)
+  {
+    cCodeSynth* cs = static_cast<cCodeSynth*>(user);
+    if (cs->fReportPrint.size() + (size_t)n + 1 > 65536) return;
+    cs->fReportPrint.append(reinterpret_cast<const char*>(s), (size_t)n);
+    cs->fReportPrint.push_back('\n');
+  }
 
   virtual void handleMidi(int frameOffset, int status, int data1, int data2) override
   {
@@ -220,6 +294,7 @@ public:
   void tickVisual()
   {
     auto now = std::chrono::steady_clock::now();
+    memset(fVisualRendered, 0, sizeof(fVisualRendered));
 
     bool haveSynth = fVisual.valid();
     if (fVisualDelayMs > 0.f && !fVisualDelayQueue.empty())
@@ -266,18 +341,37 @@ public:
     });
 
     fVoiceArgsCapturedThisTick = false;
+    // One inspection pass per tick, from the pipeline compiled with the probes.
+    fInspecting = fInspect.begin && !fVisualProbes.probes.empty() &&
+                  fVisual.current->probeSerial != 0 && fVisual.current->probeSerial == fVisualProbes.serial;
+    if (fInspecting) fInspect.begin(fInspect.user, fVisual.current->probeSerial);
+    // A new pipeline reports how the open entry's first run went.
+    fReporting = fInspect.ran && fReportedPipeline != fVisual.current;
+    fReportOk = true;
+    fReportPrint.clear();
+    bool reported = false;
+
     int rendered = 0;
     for (int i = 0; i < numActive; i++)
     {
       const cCodeSynthLiveVoice& v = fVisual.voice[sorted[i].voiceIdx];
-      if (runVisualVoice(v.synthId, v.midiNoteId, v.freqMul, v.timeStampTriggered, beat, v.velocity))
+      if (runVisualVoice(v.synthId, v.midiNoteId, v.freqMul, v.timeStampTriggered, beat, v.velocity, &reported))
         rendered++;
     }
 
     if (rendered == 0)
-      runVisualPreview(beat);
+      runVisualPreview(beat, &reported);
     else if (!fVoiceArgsCapturedThisTick)
       captureVisualPreviewArgs(beat);
+
+    if (fInspecting) fInspect.end(fInspect.user);
+    fInspecting = false;
+    if (reported)
+    {
+      fReportedPipeline = fVisual.current;
+      fInspect.ran(fInspect.user, fReportOk, fReportPrint.data(), (int)fReportPrint.size());
+    }
+    fReporting = false;
 
     // Nothing spoke for the open entry: drop the reading rather than show another
     // entry's.
@@ -333,7 +427,8 @@ public:
   }
 
   // Returns whether a body ran. `vel` is raw MIDI; the idle preview passes 127.
-  bool runVisualVoice(int synthId, int midiNote, float freqMul, int startTime, double beat, double vel)
+  bool runVisualVoice(int synthId, int midiNote, float freqMul, int startTime, double beat, double vel,
+                      bool* reported = nullptr)
   {
     const cCodeSynthVoice& voice = fVisual.current->synth[synthId];
 
@@ -365,13 +460,29 @@ public:
     // Frame-temporary images and an empty target stack per body, as the exported
     // song does.
     render_ctx_images_reset(&fRenderCtx);
-    func_run(fn, &a, kCodeSynthVisualOpBudget);
+    // Every visual VM may carry an inspect(); only the open entry's has probes.
+    vm_set_inspect_sink(voice.vm, fInspecting ? inspectSink : nullptr, this);
+    vm_set_inspect_array_sink(voice.vm, fInspecting ? inspectArrSink : nullptr, this);
+    bool report = fReporting && reported && !*reported && synthId == visualPreviewSynthId(NULL);
+    vm_set_print_sink(voice.vm, report ? reportPrint : nullptr, this);
+    VMStatus st = func_run(fn, &a, kCodeSynthVisualOpBudget);
+    if (report) { *reported = true; fReportOk = st == VM_OK; vm_set_print_sink(voice.vm, nullptr, nullptr); }
     // `screen[i] = c` bypasses the primitives' generation bump.
     vscreen_touch_ctx(&fRenderCtx);
+    fVisualRendered[synthId] = true;
     return true;
   }
 
-  void runVisualPreview(double beat)
+  // Whether the body (channel, note) plays had its visual half run in the last tick.
+  bool visualNoteRendered(int midiChannel, int midiNote) const
+  {
+    if (!fVisual.current || midiChannel < 0 || midiChannel > 15 || midiNote < 0 || midiNote > 127)
+      return false;
+    unsigned char slot = fVisual.current->map[midiChannel * 128 + midiNote];
+    return slot != 0 && fVisualRendered[slot - 1];
+  }
+
+  void runVisualPreview(double beat, bool* reported = nullptr)
   {
     float freqMul = 1.0f;
     int synthId = visualPreviewSynthId(&freqMul);
@@ -380,7 +491,7 @@ public:
     // No clear for a body without a visual half; it would blank the last frame.
     if (fVisual.current->synth[synthId].fn != NULL)
       vscreen_clear_ctx(&fRenderCtx, 0);
-    runVisualVoice(synthId, fVisualPreviewNote, freqMul, fVisualPreviewStartTime, beat, 127.0);
+    runVisualVoice(synthId, fVisualPreviewNote, freqMul, fVisualPreviewStartTime, beat, 127.0, reported);
   }
 
   virtual void handleSamples(float** inputs, float** outputs, int sampleFrames) override
@@ -459,6 +570,7 @@ public:
     vscreen_ctx_provision(&fRenderCtx,
                           fScreenPixels, VSCREEN_W, VSCREEN_H,
                           fPalette, VSCREEN_PALETTE_LEN,
+                          &fLayout,
                           fGlyphScratch, VSCREEN_GLYPH_SCRATCH_BYTES,
                           fImageArena, VSCREEN_IMAGE_ARENA_BYTES,
                           fImages, VSCREEN_MAX_IMAGES,
@@ -473,6 +585,13 @@ public:
   // With a trailing separator.
   std::string fAssetDir;
   void setAssetDir(const std::string& dir) { fAssetDir = dir; }
+
+  // Applied by each pipeline on its own thread, at its next valid().
+  void requestGlobalsReset()
+  {
+    fAudio.globalsResetRequests.fetch_add(1);
+    fVisual.globalsResetRequests.fetch_add(1);
+  }
 
   // Anything outside this class wanting the screen must come through here, never
   // vscreen_ctx().
@@ -489,8 +608,11 @@ public:
   {
     char debugMsg[1024] = {0};
     char visualDebugMsg[1024] = {0};
+    // A body that dropped its color_ramp_setup gets the default back.
+    render_ctx_color_ramp_setup_i32(&fRenderCtx, 192, 0, 2, 2, 2);
+    fLastContent = content;
     fAudio.compile(content, fAssetDir, false, debugMsg, 1023, &fRenderCtx);
-    fVisual.compile(content, fAssetDir, true, visualDebugMsg, 1023, &fRenderCtx);
+    fVisual.compile(content, fAssetDir, true, visualDebugMsg, 1023, &fRenderCtx, &fVisualProbes);
     snprintf(fLastDebugMsg, sizeof(fLastDebugMsg), "%s%s", debugMsg, visualDebugMsg);
   }
 };

@@ -412,7 +412,7 @@ static void gr_rasterize(const GrPath* p, int width, int height,
 #if USE_UNIFIED_BLEND
     // One resolve for the whole path: mode, alpha and channel mask all fold
     // into the tables here and never appear in the blit loop below.
-    RBlend rb = rb_make(blending_flags, -1, alpha);
+    RBlend rb = RB_MAKE(surf, blending_flags, -1, alpha);
 #else
     int divisor = 255 * POLY_SUBSAMPLES;
 
@@ -672,15 +672,12 @@ static void gr_rasterize(const GrPath* p, int width, int height,
             // Rounded, not truncated -- see RB_COV8.
             #define RB_COV8(c) (((c) + POLY_SUBSAMPLES / 2) / POLY_SUBSAMPLES)
             unsigned char *row = output + (size_t)oy * dst_stride + org_x;
-  #if RS_PEBBLE_TIME2
             if (!rb.gray8) {
                 for (int x = bx0; x < bx1; x++) {
                     POLY_ZERO_COV_SKIP(coverage[x]);
-                    row[x] = rb_px(&rb, row[x], RB_COV8(coverage[x]),
-                                   RB_DITHER_AT(org_x + x, oy));
+                    row[x] = RB_PX_A(&rb, row[x], RB_COV8(coverage[x]), org_x + x, oy);
                 }
             } else
-  #endif
             {
                 for (int x = bx0; x < bx1; x++) {
                     POLY_ZERO_COV_SKIP(coverage[x]);

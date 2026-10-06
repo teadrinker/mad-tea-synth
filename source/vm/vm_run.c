@@ -497,6 +497,18 @@ void register_c_func_defaults(VM *vm, int tok, int n_defaults) {
     }
 }
 
+void register_c_func_param_names(VM *vm, int tok, const char *names) {
+    for (Func *fn = vm->run.funcs; fn; fn = fn->next) {
+        if (fn->native_tok == tok) { fn->param_names = names; return; }
+    }
+}
+
+void register_c_func_no_value(VM *vm, int tok) {
+    for (Func *fn = vm->run.funcs; fn; fn = fn->next) {
+        if (fn->native_tok == tok) { fn->native_no_value = 1; return; }
+    }
+}
+
 // Switch one optional slot's synthesized default from 0 to 1.0 -- see vm.h for
 // why the draw primitives' alpha needs it.
 void register_c_func_default_one(VM *vm, int tok, int arg_index) {
@@ -540,6 +552,27 @@ static void mark_builtin_math_pure(VmRun *run) {
         int idx = tok - TOK_MATHS_FIRST;
         if (idx < run->cfunc_table_cap) run->cfunc_table[idx].is_pure = 1;
     }
+}
+#endif
+
+#if !defined(VM_NO_COMPILER) && !defined(VM_NO_MATH)
+// What the editor shows for a call to a built-in: one table, so a new built-in
+// has one place to go.
+static void builtin_param_names(VM *vm) {
+    static const struct { int tok; const char *names; } k_names[] = {
+        { TOK_SIN, "x" },  { TOK_COS, "x" },  { TOK_EXP, "x" },  { TOK_FLOOR, "x" },
+        { TOK_FRAC, "x" }, { TOK_LOG, "x" },  { TOK_ABS, "x" },  { TOK_SQRT, "x" },
+        { TOK_SIN01, "t" }, { TOK_COS01, "t" },
+        { TOK_POW, "x, y" }, { TOK_IPOW, "x, n" }, { TOK_FMOD, "x, y" }, { TOK_ATAN2, "y, x" },
+        { TOK_MIN, "a, b" }, { TOK_MAX, "a, b" },
+        { TOK_CLAMP, "x, lo, hi" },
+        { TOK_LINEARSTEP, "a, b, x" },  { TOK_SMOOTHSTEP, "a, b, x" },  { TOK_SMOOTHERSTEP, "a, b, x" },
+        { TOK_LINEARSTEPA, "a, b, x" }, { TOK_SMOOTHSTEPA, "a, b, x" }, { TOK_SMOOTHERSTEPA, "a, b, x" },
+        { TOK_MIX, "a, b, t" },
+        { TOK_I32, "x" }, { TOK_F32, "x" }, { TOK_F64, "x" }, { TOK_I64, "x" },
+    };
+    for (int i = 0; i < (int)(sizeof(k_names) / sizeof(k_names[0])); i++)
+        register_c_func_param_names(vm, k_names[i].tok, k_names[i].names);
 }
 #endif
 
@@ -656,6 +689,9 @@ void vm_register_builtins(VM *vm) {
         func_register_id(run, fc);
 #endif
     }
+#if !defined(VM_NO_COMPILER) && !defined(VM_NO_MATH)
+    builtin_param_names(vm);
+#endif
 }
 
 
@@ -1515,6 +1551,8 @@ f->is_template = R32();
         for (int i = 0; i < n_syms; i++) {
             VMSym *s = &f->syms[i];
             s->name       = 0;  // not stored in blob
+            s->hidden     = 0;
+            s->name_dup   = 0;
             s->type.kind  = (int)((unsigned)sp[0] | ((unsigned)sp[1]<<8) | ((unsigned)sp[2]<<16) | ((unsigned)sp[3]<<24)); sp += 4;
             int packed_len = (int)((unsigned)sp[0] | ((unsigned)sp[1]<<8) | ((unsigned)sp[2]<<16) | ((unsigned)sp[3]<<24)); sp += 4;
             s->type.len       = packed_len & SYM_LEN_MASK;

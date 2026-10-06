@@ -58,6 +58,9 @@ static int compile_bitcast(VM *vm, Func *f, ASTNode *node, VMType *out_t, int *h
 // again -- and deliberately NOT under VM_HAS_INSPECT, because inspect(x) lives
 // in the user's buffer and so must compile on every target the buffer reaches.
 static int compile_inspect_intrinsic(VM *vm, Func *f, ASTNode *node, VMType *out_t, int *handled);
+#if VM_HAS_INSPECT
+static int wrap_inspect(VM *vm, Func *f, int arg, VMType at, int slot, int is_slotted, VMType *out_t);
+#endif
 // map(xs, f): unrolled at compile time, like every other vector expression.
 static int compile_map_intrinsic(VM *vm, Func *f, ASTNode *node, VMType *out_t, int *handled);
 static int compile_vec_ctor(VM *vm, Func *f, ASTNode *node, VMType *out_t, int *handled);
@@ -1228,25 +1231,48 @@ static MemBackend *long_mem(VM *vm) {
 static VMSym *sym_find(Func *f, InternID name) {
     if (!f->sym_index || name == 0) {
         for (int i = 0; i < f->n_syms; i++)
-            if (f->syms[i].name == name) return &f->syms[i];
+            if (f->syms[i].name == name && !f->syms[i].hidden) return &f->syms[i];
         return 0;
     }
     for (unsigned h = ((unsigned)name * 2654435761u) & (unsigned)f->sym_index_mask; f->sym_index[h];
          h = (h + 1) & (unsigned)f->sym_index_mask) {
         VMSym *s = &f->syms[f->sym_index[h] - 1];
-        if (s->name == name) return s;
+        if (s->name == name && !s->hidden) return s;
     }
     return 0;
 }
 
-// First one in wins, matching the scan: a later sym of the same name is shadowed.
+// The latest hidden sym named `name`, or 0.
+static VMSym *sym_find_hidden(Func *f, InternID name) {
+    if (!f->n_hidden || name == 0) return 0;
+    for (int i = f->n_syms - 1; i >= 0; i--)
+        if (f->syms[i].name == name && f->syms[i].hidden) return &f->syms[i];
+    return 0;
+}
+
+// First visible one in wins, matching the scan: a later sym of the same name is
+// shadowed. A hidden entry stays in the chain and is probed past.
 static void sym_index_put(Func *f, int i) {
     InternID name = f->syms[i].name;
-    if (name == 0) return;
+    if (name == 0 || f->syms[i].hidden) return;
     unsigned h = ((unsigned)name * 2654435761u) & (unsigned)f->sym_index_mask;
-    for (; f->sym_index[h]; h = (h + 1) & (unsigned)f->sym_index_mask)
-        if (f->syms[f->sym_index[h] - 1].name == name) return;
+    for (; f->sym_index[h]; h = (h + 1) & (unsigned)f->sym_index_mask) {
+        if (f->sym_index[h] == i + 1) return;
+        VMSym *o = &f->syms[f->sym_index[h] - 1];
+        if (o->name == name && !o->hidden) return;
+    }
     f->sym_index[h] = i + 1;
+}
+
+static void sym_hide(Func *f, VMSym *s) {
+    s->hidden = 1;
+    f->n_hidden++;
+}
+
+static void sym_unhide(Func *f, VMSym *s) {
+    s->hidden = 0;
+    f->n_hidden--;
+    if (f->sym_index) sym_index_put(f, (int)(s - f->syms));
 }
 
 static VMSym *sym_add(VM *vm, Func *f, InternID name, VMType type) {
@@ -1268,7 +1294,27 @@ static VMSym *sym_add(VM *vm, Func *f, InternID name, VMType type) {
     s->name = name;
     s->type = type;
     s->offset = -1;
+    s->name_dup = sym_find_hidden(f, name) != 0;
     if (f->sym_index) sym_index_put(f, f->n_syms - 1);
+    return s;
+}
+
+// A new variable: the slot a `for ... in` loop left behind under this name when
+// the type is the same, else a fresh one.
+static VMSym *sym_declare(VM *vm, Func *f, InternID name, VMType type, int shift) {
+    for (int i = f->n_hidden ? f->n_syms - 1 : -1; i >= 0; i--) {
+        VMSym *h = &f->syms[i];
+        if (h->name != name || !h->hidden) continue;
+        if (h->shift == shift && h->type.kind == type.kind && h->type.len == type.len
+            && h->type.elem_shift == type.elem_shift && h->type.pack_bits == type.pack_bits
+            && h->type.inner_len == type.inner_len && h->type.struct_id == type.struct_id
+            && h->type.is_const == type.is_const) {
+            sym_unhide(f, h);
+            return h;
+        }
+    }
+    VMSym *s = sym_add(vm, f, name, type);
+    s->shift = shift;
     return s;
 }
 
@@ -1641,6 +1687,7 @@ void vm_register_lib_defaults(VM *vm) {
     vm_declare_lib_func(vm, "rotateZ",       VM_LIB_SRC_ROTATEZ);
     vm_declare_lib_func(vm, "euler",         VM_LIB_SRC_EULER);
     vm_declare_lib_func(vm, "project",       VM_LIB_SRC_PROJECT);
+    vm_declare_lib_func(vm, "rgb",           VM_LIB_SRC_RGB);
     vm_declare_lib_func_accel(vm, "dot",         VM_LIB_SRC_DOT,         VM_LIB_ACCEL(acc_dot));
     vm_declare_lib_func_accel(vm, "length",      VM_LIB_SRC_LENGTH,      VM_LIB_ACCEL(acc_length));
     vm_declare_lib_func_accel(vm, "distance",    VM_LIB_SRC_DISTANCE,    VM_LIB_ACCEL(acc_distance));
@@ -2991,6 +3038,12 @@ static int compile_ident(VM *vm, Func *f, ASTNode *n, VMType *out_t) {
     if (d) return compile_define_use(vm, f, n, d, out_t);
     VMConst *k = const_find(vm, n->token);
     if (k) return compile_const_use(vm, f, n, k, out_t);
+    if (!sym_find(f, n->token) && sym_find_hidden(f, n->token)) {
+        const char *nm = intern_get_cstr(vm->intern, n->token);
+        vm_errorf_at(vm, n, "'%s' only exists inside its for loop; to read it afterwards, "
+                            "assign %s before the loop", nm, nm);
+        return -1;
+    }
     VMSym *s = resolve_name(vm, f, n->token);
     if (!s) {
 #if VM_REACTIVE
@@ -5333,14 +5386,16 @@ static int compile_call(VM *vm, Func *f, ASTNode *node, VMType *out_t) {
     }
     int n_args  = dst;
     int n_slots = callee->n_params;
+    const char *who = callee->name ? intern_get_cstr(vm->intern, callee->name) : "";
+    const char *sp  = callee->name ? " " : "";
 
     if (callee->has_rest) {
         // Everything past the fixed parameters is gathered into one hidden array
         // local, which the rest parameter takes as an ordinary slice.
         int n_fixed = n_slots - 1;
         if (n_args < n_fixed) {
-            vm_errorf_at(vm, node, "expected at least %d arg(s), got %d%s",
-                         n_fixed, n_args, n_spread ? " after spreading" : "");
+            vm_errorf_at(vm, node, "%s%sexpected at least %d arg(s), got %d%s",
+                         who, sp, n_fixed, n_args, n_spread ? " after spreading" : "");
             return -1;
         }
         if (gather_rest_args(vm, f, node, callee, arg_ir, arg_types, n_fixed, n_args,
@@ -5351,9 +5406,9 @@ static int compile_call(VM *vm, Func *f, ASTNode *node, VMType *out_t) {
         if (n_args < n_required || n_args > n_slots) {
             const char *how = n_spread ? " after spreading" : "";
             if (callee->n_defaults)
-                vm_errorf_at(vm, node, "expected %d..%d arg(s), got %d%s", n_required, n_slots, n_args, how);
+                vm_errorf_at(vm, node, "%s%sexpected %d..%d arg(s), got %d%s", who, sp, n_required, n_slots, n_args, how);
             else
-                vm_errorf_at(vm, node, "expected %d arg(s), got %d%s", n_slots, n_args, how);
+                vm_errorf_at(vm, node, "%s%sexpected %d arg(s), got %d%s", who, sp, n_slots, n_args, how);
             return -1;
         }
     }
@@ -6461,6 +6516,14 @@ static int compile_inspect_intrinsic(VM *vm, Func *f, ASTNode *node, VMType *out
     *out_t = at;
     return arg;
 #else
+    return wrap_inspect(vm, f, arg, at, slot, is_slotted, out_t);
+#endif
+}
+
+#if VM_HAS_INSPECT
+// The IR_INSPECT around an already-compiled operand `arg` of type `at`, shared
+// by both spellings and by probes. `slotted` allows the array-literal hoist.
+static int wrap_inspect(VM *vm, Func *f, int arg, VMType at, int slot, int is_slotted, VMType *out_t) {
     // Unsupported operand type -> the operand ALONE, with no node built. Hovering a
     // string, an array, a slice or a void call must not fail the compile; it must
     // produce a program that still runs and simply reports nothing.
@@ -6544,7 +6607,83 @@ static int compile_inspect_intrinsic(VM *vm, Func *f, ASTNode *node, VMType *out
     *out_t = at;
     // (t = literal, __ins(t, id)): the assignment runs, the report is the value.
     return inline_comma(vm, f, ir, at, items, n_items);
+}
+
+void vm_set_inspect_probes(VM *vm, const VMProbe *probes, int n) {
+    if (!vm) return;
+    if (n < 0 || !probes) n = 0;
+    if (n > VM_MAX_PROBES) n = VM_MAX_PROBES;
+    for (int i = 0; i < n; i++) vm->probes[i] = probes[i];
+    vm->n_probes   = n;
+    vm->probe_busy = 0;
+}
 #endif // VM_HAS_INSPECT
+
+int vm_subtree_span(const ParseResult *pr, ASTNode *node, size_t text_len,
+                    size_t *out_lo, size_t *out_hi) {
+    if (!pr || !pr->txt_to_ref || !node) return 0;
+    size_t lo = (size_t)-1, hi = 0;
+    size_t n = pr->num_txt_to_ref;
+    if (n > text_len) n = text_len;
+    for (size_t o = 0; o < n; o++) {
+        for (ASTNode *p = pr->txt_to_ref[o]; p; p = p->parent) {
+            if (p != node) continue;
+            if (o < lo) lo = o;
+            if (o + 1 > hi) hi = o + 1;
+            break;
+        }
+    }
+    if (lo == (size_t)-1 || hi <= lo) return 0;
+    *out_lo = lo;
+    *out_hi = hi;
+    return 1;
+}
+
+// The ORDER is load-bearing: cutting a whole-scope span at line one's `//`
+// first would make it single-line and pass the newline refusal.
+int vm_inspect_span_clamp(const char *text, size_t *lo, size_t *hi) {
+    size_t a = *lo, b = *hi;
+    for (size_t o = a; o < b; o++)
+        if (text[o] == '\n' || text[o] == '\r') return 0;
+    for (size_t o = a; o + 1 < b; o++)
+        if (text[o] == '/' && (text[o + 1] == '/' || text[o + 1] == '*')) { b = o; break; }
+    while (b > a && (text[b - 1] == ' ' || text[b - 1] == '\t')) b--;
+    if (b <= a) return 0;
+    *lo = a;
+    *hi = b;
+    return 1;
+}
+
+ASTNode *vm_probe_node_for_span(const ParseResult *pr, const char *text, size_t text_len,
+                                size_t lo, size_t hi) {
+    if (!pr || !pr->txt_to_ref || !text || lo >= hi || lo >= pr->num_txt_to_ref) return 0;
+    // Every candidate is on the chain above the span's first byte.
+    ASTNode *chain[64];
+    size_t   clo[64], chi[64];
+    int nc = 0;
+    for (ASTNode *p = pr->txt_to_ref[lo]; p && nc < 64; p = p->parent) {
+        chain[nc] = p; clo[nc] = (size_t)-1; chi[nc] = 0; nc++;
+    }
+    if (nc == 0) return 0;
+    size_t n = pr->num_txt_to_ref;
+    if (n > text_len) n = text_len;
+    for (size_t o = 0; o < n; o++) {
+        for (ASTNode *p = pr->txt_to_ref[o]; p; p = p->parent) {
+            for (int k = 0; k < nc; k++) {
+                if (chain[k] != p) continue;
+                if (o < clo[k]) clo[k] = o;
+                if (o + 1 > chi[k]) chi[k] = o + 1;
+            }
+        }
+    }
+    for (int k = 0; k < nc; k++) {
+        size_t a = clo[k], b = chi[k];
+        if (a == (size_t)-1 || b <= a) continue;
+        if (a < lo) break;   // outer nodes only grow
+        if (a == lo && b == hi) return chain[k];
+        if (vm_inspect_span_clamp(text, &a, &b) && a == lo && b == hi) return chain[k];
+    }
+    return 0;
 }
 
 // bitcast(T, x) -- reinterpret x's bits as T, with no numeric conversion. The
@@ -7737,7 +7876,30 @@ static int compile_map_intrinsic(VM *vm, Func *f, ASTNode *node, VMType *out_t, 
     return vec_materialise(vm, f, lane, lane_t, n, 0, pre, n_pre, cap_pre, out_t);
 }
 
+static int compile_expr_node(VM *vm, Func *f, ASTNode *node, VMType *out_t);
+
+// compile_expr_node, wrapped in IR_INSPECT when `node` (or what its parens hold)
+// is a probe: exactly what __ins(node, id) would have built.
 static int compile_expr(VM *vm, Func *f, ASTNode *node, VMType *out_t) {
+#if VM_HAS_INSPECT
+    if (vm->n_probes && node) {
+        ASTNode *inner = paren_inner(node);
+        for (int i = 0; i < vm->n_probes; i++) {
+            ASTNode *pn = vm->probes[i].node;
+            if ((pn != node && pn != inner) || (vm->probe_busy & (1u << i))) continue;
+            vm->probe_busy |= 1u << i;
+            VMType at;
+            int arg = compile_expr_node(vm, f, node, &at);
+            vm->probe_busy &= ~(1u << i);
+            if (arg < 0) return -1;
+            return wrap_inspect(vm, f, arg, at, vm->probes[i].id, 1, out_t);
+        }
+    }
+#endif
+    return compile_expr_node(vm, f, node, out_t);
+}
+
+static int compile_expr_node(VM *vm, Func *f, ASTNode *node, VMType *out_t) {
     if (!node) { vm_set_error_at(vm, 0, "null expr"); return -1; }
 #if VM_MAX_COMPILE_STACK
     {
@@ -9638,6 +9800,11 @@ static int try_unroll_range(VM *vm, Func *f, ASTNode *var, int iasn, int end, in
 // Desugars to exactly the three-clause loop (init in the enclosing statement list,
 // cond, step), so `break`/`continue` and every backend need to know nothing about
 // it. Returns 1, or -1 with the error set.
+static void loop_var_end(Func *f, InternID name) {
+    VMSym *s = sym_find(f, name);
+    if (s && !s->is_global && !s->is_host_buf && !s->is_func) sym_hide(f, s);
+}
+
 static int compile_for_range(VM *vm, Func *f, ASTNode *var, ASTNode *range,
                              ASTNode *body_ast, int **slot, int *count, int *cap) {
     ASTNode init, one, bin, step;
@@ -9791,8 +9958,7 @@ static int loop_elem_assign(VM *vm, Func *f, ASTNode *var, ASTNode *seq, VMType 
     }
     int xslot;
     if (!xs) {
-        xs = sym_add(vm, f, var->token, ct_vmtype_clear_shift(et));
-        xs->shift = ct_shift(et);
+        xs = sym_declare(vm, f, var->token, ct_vmtype_clear_shift(et), ct_shift(et));
         xslot = (int)(xs - f->syms);
     } else {
         xslot = (int)(xs - f->syms);
@@ -10146,6 +10312,15 @@ static int compile_stmt_into(VM *vm, Func *f, ASTNode *node, int **slot, int *co
     if (!node) return 1;
     vm->err_ctx = node;
 
+#if VM_HAS_INSPECT
+    // A probed `a += b` reports the value it leaves, as __ins((a += b), id)
+    // would: the expression-statement path compiles it in value position.
+    if (vm->n_probes && TOKEN_IS_COMPOUND_ASSIGN(node->token)) {
+        for (int i = 0; i < vm->n_probes; i++)
+            if (vm->probes[i].node == node) goto expr_stmt;
+    }
+#endif
+
     // Bare identifier statements: break / continue.
     //
     // Anything else falls through: a lone `return` reaches the keyword branch
@@ -10274,12 +10449,23 @@ static int compile_stmt_into(VM *vm, Func *f, ASTNode *node, int **slot, int *co
                 }
                 if (!seq)
                     { vm_set_error_at(vm, rng->right, "for ... in needs a range or a sequence: for i in 0..n, or for x in xs"); return -1; }
+                // A name the loop declares lives only as long as the loop; one that
+                // existed before it is the loop's to reuse, and keeps the last value.
+                int var_new = !sym_find(f, var->token);
+                int ix_new  = ixvar && !sym_find(f, ixvar->token);
+                int r;
                 if (is_range_node(seq)) {
                     if (ixvar)
                         { vm_set_error_at(vm, ixvar, "for i, x in ... iterates a sequence; a range is already its own index"); return -1; }
-                    return compile_for_range(vm, f, var, seq, args[1], slot, count, cap);
+                    r = compile_for_range(vm, f, var, seq, args[1], slot, count, cap);
+                } else {
+                    r = compile_for_sequence(vm, f, ixvar, var, seq, args[1], slot, count, cap);
                 }
-                return compile_for_sequence(vm, f, ixvar, var, seq, args[1], slot, count, cap);
+                if (r > 0) {
+                    if (var_new) loop_var_end(f, var->token);
+                    if (ix_new)  loop_var_end(f, ixvar->token);
+                }
+                return r;
             }
             if (!is_paren(ctrl) || ctrl->items.size != 3)
                 { vm_set_error_at(vm, ctrl, "for requires three ';'-separated clauses: for(init; cond; step) {...}"); return -1; }
@@ -10590,8 +10776,7 @@ static int compile_stmt_into(VM *vm, Func *f, ASTNode *node, int **slot, int *co
                     && autoconst_declare(vm, f, nm, r, rt))
                     return 1;
                 // Declaration on first assign.
-                s = sym_add(vm, f, nm, ct_vmtype_clear_shift(rt));
-                s->shift = ct_shift(rt);
+                s = sym_declare(vm, f, nm, ct_vmtype_clear_shift(rt), ct_shift(rt));
                 si = (int)(s - f->syms);
             } else {
                 int rs = ct_shift(rt);
@@ -10831,6 +11016,9 @@ static int compile_stmt_into(VM *vm, Func *f, ASTNode *node, int **slot, int *co
     }
 
     // Otherwise: expression statement (e.g. a call)
+#if VM_HAS_INSPECT
+expr_stmt:;
+#endif
     VMType et;
     int e = compile_expr(vm, f, node, &et);
     if (e < 0) return -1;
@@ -12183,6 +12371,23 @@ static const struct { const char *name; int flag; } directive_flags[] = {
     { "c_float_to_int",   VM_FLAG_C_FLOAT_TO_INT    },
 };
 
+static const char *const directive_extra_options[] = { "undefined_behaviour", "source_builtins", "capture" };
+
+static const int directive_default_flags = VM_FLAG_CHECK_DIV_ZERO | VM_FLAG_INLINE_POWERS | VM_FLAG_IDENTITY_ELIM | VM_FLAG_AUTO_PACK | VM_FLAG_AUTO_VEC | VM_FLAG_FX_I64_WIDE | VM_FLAG_INT_WRAP | VM_FLAG_CONST_FOLD | VM_FLAG_CONST_PRECISE | VM_FLAG_AUTO_CONST | VM_FLAG_SWIZZLE | VM_FLAG_UNROLL;
+
+int vm_directive_option_default(int i) {
+    int nf = (int)(sizeof(directive_flags) / sizeof(directive_flags[0]));
+    return i >= 0 && i < nf && (directive_flags[i].flag & directive_default_flags) != 0;
+}
+
+const char *vm_directive_option_name(int i) {
+    int nf = (int)(sizeof(directive_flags) / sizeof(directive_flags[0]));
+    int ne = (int)(sizeof(directive_extra_options) / sizeof(directive_extra_options[0]));
+    if (i < 0) return 0;
+    if (i < nf) return directive_flags[i].name;
+    return i - nf < ne ? directive_extra_options[i - nf] : 0;
+}
+
 // #enable (on = 1) and #disable (on = 0).
 static int directive_toggle(VM *vm, ASTNode **chain, int n, int on) {
     const char *what = on ? "#enable" : "#disable";
@@ -12508,7 +12713,7 @@ static unsigned long long globals_layout_hash(const VMGlobalTable *t) {
 // compiler temporary (name == 0, from ** expansion and friends -- not
 // user-visible, and each call needs its own), or an already-imported global.
 static int sym_is_top_level_var(const VMSym *s) {
-    return !s->is_func && !s->is_global && !s->is_host_buf
+    return !s->is_func && !s->is_global && !s->is_host_buf && !s->hidden
         && s->name != 0 && s->type.kind != VMT_VOID;
 }
 
@@ -12629,6 +12834,46 @@ Func *vm_declare_globals(VM *vm, ASTNode *node, ParseResult *pres,
     return init;
 }
 
+static int globals_same_slot(const VMGlobal *a, const VMGlobal *b) {
+    return a->type.kind == b->type.kind && a->type.len == b->type.len
+        && a->type.pack_bits == b->type.pack_bits && a->shift == b->shift
+        && a->struct_hash == b->struct_hash && s_strcmp(a->struct_name, b->struct_name) == 0;
+}
+
+static int globals_bytes_equal(const unsigned char *a, const unsigned char *b, size_t n) {
+    for (size_t i = 0; i < n; i++) if (a[i] != b[i]) return 0;
+    return 1;
+}
+
+// See vm.h. Slices are refused: their pointer usually leads into the old
+// program's literals, which go away with it.
+int vm_globals_migrate(Tsys *sys,
+                       const VMGlobalTable *from_tbl, const void *from_block, const void *from_init,
+                       const VMGlobalTable *to_tbl, void *to_block, const void *to_init) {
+    if (!sys || !from_tbl || !from_block || !to_tbl || !to_block) return 0;
+    const unsigned char *src  = (const unsigned char*)from_block;
+    const unsigned char *srci = (const unsigned char*)from_init;
+    const unsigned char *dsti = (const unsigned char*)to_init;
+    unsigned char *dst = (unsigned char*)to_block;
+    const int check_init = from_init && to_init;
+    int carried = 0;
+    for (int i = 0; i < to_tbl->count; i++) {
+        const VMGlobal *t = &to_tbl->g[i];
+        if (is_slice(t->type.kind)) continue;
+        const VMGlobal *f = 0;
+        for (int k = 0; k < from_tbl->count; k++)
+            if (s_strcmp(from_tbl->g[k].name, t->name) == 0) { f = &from_tbl->g[k]; break; }
+        if (!f || !globals_same_slot(f, t)) continue;
+        size_t n = (size_t)vt_slot_bytes(t->type);
+        if (n == 0) continue;
+        if ((size_t)f->offset + n > from_tbl->size || (size_t)t->offset + n > to_tbl->size) continue;
+        if (check_init && !globals_bytes_equal(srci + f->offset, dsti + t->offset, n)) continue;
+        sys->memcpy(dst + t->offset, src + f->offset, n);
+        carried++;
+    }
+    return carried;
+}
+
 void vm_set_globals_c_prefix(VM *vm, const char *prefix) {
     if (!vm) return;
     size_t n = prefix ? s_strlen(prefix) : 0;
@@ -12694,7 +12939,159 @@ int vm_declare_host_buffer(VM *vm, int id, const char *name, VMType type,
     vm->host_bufs[id].c_name     = c_name ? c_name : name;
     vm->host_bufs[id].c_len_expr = c_len_expr;
     vm->host_bufs[id].declared   = 1;
+    vm->host_bufs[id].mem_placed = 0;
     return 1;
+}
+
+int vm_place_host_buffer(VM *vm, int id, int addr, int len) {
+    if (!vm || id < 0 || id >= VM_MAX_HOST_BUFS || !vm->host_bufs[id].declared) return 0;
+    if (addr < 0 || len < 0) return 0;
+    vm->host_bufs[id].mem_addr   = addr;
+    vm->host_bufs[id].mem_len    = len;
+    vm->host_bufs[id].mem_placed = 1;
+    return 1;
+}
+
+// ---- name catalog (vm_enumerate_names) ----
+
+static const char *const k_intrinsic_names[] = {
+    "print", "inspect", "str", "slice", "map", "bitcast", "return",
+    "if", "else", "while", "for", "in", "then", "do", "break", "continue",
+    "const", "struct", "ref", "as", 0
+};
+
+static int name_type_append(char *out, int cap, int pos, VTKind k, int shift, int pack_bits) {
+    const char *t = "?";
+    char fx[16];
+    switch (k) {
+    case VMT_VOID: t = "void"; break;
+    case VMT_I32:
+        if (shift) { s_snprintf(fx, sizeof(fx), "fx%d", shift); t = fx; }
+        else t = "i32";
+        break;
+    case VMT_F32: t = "f32"; break;
+    case VMT_F64: t = "f64"; break;
+    case VMT_I64: t = "i64"; break;
+    case VMT_SLICE_I32: t = pack_bits == 8 ? "[]u8" : "[]i32"; break;
+    case VMT_SLICE_F32: t = "[]f32"; break;
+    case VMT_SLICE_F64: t = "[]f64"; break;
+    case VMT_SLICE_I64: t = "[]i64"; break;
+    default: break;
+    }
+    int n = s_snprintf(out + pos, (size_t)(cap - pos), "%s", t);
+    return n > 0 && pos + n < cap ? pos + n : pos;
+}
+
+// The text between the parentheses of a library entry's `name = (params) =>`,
+// with how many parameters it holds and how many of them carry a default.
+static int lib_params_text(const char *src, char *out, int cap, int *n_params, int *n_opt) {
+    const char *p = src;
+    while (*p && *p != '(') p++;
+    if (*p != '(') return 0;
+    p++;
+    int depth = 0, commas = 0, len = 0, any = 0, opt = 0;
+    for (; *p; p++) {
+        char c = *p;
+        if (c == '(' || c == '[') depth++;
+        else if (c == ')' || c == ']') { if (depth == 0) break; depth--; }
+        if (len < cap - 1) out[len++] = c;
+        if (depth != 0) continue;
+        if (c == ',') commas++;
+        else if (c == '=') opt++;
+        else if (c != ' ') any = 1;
+    }
+    while (len > 0 && out[len - 1] == ' ') len--;
+    out[len] = '\0';
+    *n_params = any ? commas + 1 : 0;
+    *n_opt    = opt;
+    return 1;
+}
+
+static int name_is_internal(const char *s) {
+    return !s || !s[0] || (s[0] == '_' && s[1] == '_');
+}
+
+void vm_enumerate_names(VM *vm, VMNameFn fn, void *user) {
+    if (!vm || !fn) return;
+    VMNameInfo info;
+
+    for (Func *f = vm->run.funcs; f; f = f->next) {
+        if (f->native_tok == 0 || f->name == 0) continue;
+        const char *nm = intern_get_cstr(vm->intern, f->name);
+        if (name_is_internal(nm)) continue;
+        char types[160];
+        types[0] = '\0';
+        vm->run.sys->memset(&info, 0, sizeof(info));
+        info.name       = nm;
+        info.kind       = VM_NAME_NATIVE;
+        info.n_params   = f->n_params;
+        info.n_optional = f->n_defaults;
+        info.params     = f->param_names;
+        int idx = f->native_tok - TOK_MATHS_FIRST;
+        if (idx >= 0 && idx < vm->run.cfunc_table_cap && vm->run.cfunc_table[idx].has_sig) {
+            const CFuncEntry *ce = &vm->run.cfunc_table[idx];
+            int pos = 0;
+            for (int i = 0; i < ce->n_sig_args; i++) {
+                int shift = ce->arg_kinds[i] == VMT_I32 ? ce->sig_scalar_shift : 0;
+                pos = name_type_append(types, (int)sizeof(types), pos, ce->arg_kinds[i], shift, ce->arg_pack_bits[i]);
+                if (i + 1 < ce->n_sig_args && pos + 2 < (int)sizeof(types)) { types[pos++] = ','; types[pos++] = ' '; types[pos] = '\0'; }
+            }
+            info.param_types = types;
+            info.ret_type = ce->ret_kind == VMT_VOID ? "void" : (ce->ret_kind == VMT_I32 ? "i32" : 0);
+        }
+        if (f->native_no_value) info.ret_type = "void";
+        fn(user, &info);
+    }
+
+    for (int i = 0; i < vm->n_lib; i++) {
+        const char *nm = intern_get_cstr(vm->intern, vm->lib[i].name);
+        if (name_is_internal(nm) || !vm->lib[i].src) continue;
+        char params[256];
+        vm->run.sys->memset(&info, 0, sizeof(info));
+        info.name     = nm;
+        info.kind     = VM_NAME_LIB;
+        info.n_params = -1;
+        if (lib_params_text(vm->lib[i].src, params, (int)sizeof(params), &info.n_params, &info.n_optional))
+            info.params = params;
+        fn(user, &info);
+    }
+
+    static const char *const k_const_names[] = { "pi", "tau", 0 };
+    for (int i = 0; k_const_names[i]; i++) {
+        vm->run.sys->memset(&info, 0, sizeof(info));
+        info.name = k_const_names[i]; info.kind = VM_NAME_CONST; info.n_params = -1;
+        fn(user, &info);
+    }
+    for (VMConst *c = vm->host_consts; c; c = c->next) {
+        const char *nm = intern_get_cstr(vm->intern, c->name);
+        if (name_is_internal(nm)) continue;
+        vm->run.sys->memset(&info, 0, sizeof(info));
+        info.name = nm; info.kind = VM_NAME_CONST; info.n_params = -1;
+        fn(user, &info);
+    }
+
+    for (int i = 0; i < VM_MAX_HOST_BUFS; i++) {
+        if (!vm->host_bufs[i].declared) continue;
+        const char *nm = intern_get_cstr(vm->intern, vm->host_bufs[i].name);
+        if (name_is_internal(nm)) continue;
+        vm->run.sys->memset(&info, 0, sizeof(info));
+        info.name = nm; info.kind = VM_NAME_HOST_BUF; info.n_params = -1;
+        fn(user, &info);
+    }
+
+    for (int i = 0; i < vm->n_globals; i++) {
+        const char *nm = intern_get_cstr(vm->intern, vm->globals[i].name);
+        if (name_is_internal(nm)) continue;
+        vm->run.sys->memset(&info, 0, sizeof(info));
+        info.name = nm; info.kind = VM_NAME_GLOBAL; info.n_params = -1;
+        fn(user, &info);
+    }
+
+    for (int i = 0; k_intrinsic_names[i]; i++) {
+        vm->run.sys->memset(&info, 0, sizeof(info));
+        info.name = k_intrinsic_names[i]; info.kind = VM_NAME_INTRINSIC; info.n_params = -1;
+        fn(user, &info);
+    }
 }
 
 void vm_import_globals(VM *vm, const VMGlobalTable *tbl) {

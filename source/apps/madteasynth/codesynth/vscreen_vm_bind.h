@@ -24,6 +24,8 @@ void vscreen_text_ctx(void *ctx, int x, int y, int size, int stroke_width,
                       int letter_spacing, int line_height);
 int  vscreen_font_i32_ctx(void *ctx, int id);
 int  vscreen_text_align_i32_ctx(void *ctx, int id);
+int  vscreen_color_ramp_setup_i32_ctx(void *ctx, int add, int bit_offset,
+                                      int low, int mid, int high);
 int  vscreen_image_alloc_i32_ctx(void *ctx, int w, int h);
 int  vscreen_image_getpixel_i32_ctx(void *ctx, int image_id, int x, int y);
 int  vscreen_image_sample_fx16_ctx(void *ctx, int image_id, int x, int y);

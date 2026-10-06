@@ -88,9 +88,63 @@ enum {
 #define UI_OPTION_ALIGN_LEFT (1 << 2) // left-align the label (default: centred, like ui_button)
 #define UI_OPTION_FILL_WIDTH (1 << 3) // divide ui_avail_width() evenly instead of max(len)+2
 #define UI_OPTION_DIM_WHEN_OFF (1 << 4)
+#define UI_OPTION_NO_MARGIN  (1 << 5) // no padding cell either side: the label fills the button
+
+// ui_popup_begin flags
+#define UI_POPUP_BORDER       (1 << 0)
+#define UI_POPUP_CAPTURE_KEYS (1 << 1) // keys go to the body only while the mouse is over it
+#define UI_POPUP_STAY_OPEN    (1 << 2) // a press outside does not close it
+#define UI_POPUP_PLAIN_BG     (1 << 3) // default background, not lifted one step
+#define UI_POPUP_ALIGN_LEFT   (1 << 4) // anchored: left edge on the anchor's, not centred under it
 
 typedef struct UIContext UIContext;
 // OutputCell is typedef'd to TMCell in textmode_cell.h
+
+// Input parked away from code that must not see it (a disabled scope, or
+// everything outside an open popup's body), restored when it may again.
+typedef struct UIInputSnapshot {
+    float mouse_x, mouse_y, mouse_dx, mouse_dy;
+    float wheel;
+    int   mouse_down[3], mouse_pressed[3], mouse_released[3];
+    int   num_key_events, num_char_events;
+} UIInputSnapshot;
+
+// The open ui_popup_begin popup. Rects are screen cells.
+typedef struct UIPopup {
+    unsigned int id;                   // 0 = none open
+    int   x, y, w, h;                  // placed rect, written by ui_popup_end
+    int   rect_valid;
+    float anchor_x, anchor_y, anchor_w, anchor_h;
+    int   anchored;
+    float spawn_x, spawn_y;
+    int   flags;
+    int   opened_this_frame;
+    int   begun_this_frame;
+    int   owns_capture;                // active_id was taken inside the body
+    int   layer_used;                  // the layer holds this frame's body
+    int   src_x, src_y;                // where the body was drawn this frame
+    float req_w, req_h;
+    float inner_x, inner_y;
+    float extent_x, extent_y;
+    int   active_before;
+    int   ctrl_edited;                 // ui_multi_dropdown: changed while Ctrl was held
+    int   checkbox_view;               // ui_multi_dropdown: opened on a multi-selection
+} UIPopup;
+
+// Caller state ui_popup_begin sets aside for the body.
+typedef struct UIPopupSaved {
+    unsigned int body_id;
+    OutputCell  *screen;
+    float pen_x, pen_y, line_start_x, content_max_x, line_height;
+    bool  same_line;
+    float last_x, last_y, last_w, last_h;
+    int   item_width_sp;
+    int   label_width_sp;
+    int   clip_x0, clip_y0, clip_x1, clip_y1, clip_sp;
+    int   id_stack_sp;
+    int   blind;                    // opening frame: the body is not where it will land
+    UIInputSnapshot blind_parked;
+} UIPopupSaved;
 
 typedef struct UIControl {
     float x, y, w, h;
@@ -158,22 +212,20 @@ struct UIContext {
     float last_w, last_h;     // last placed widget size
     float item_width_stack[16];
     int   item_width_sp;
+    int   label_width_stack[16];
+    int   label_width_sp;
 
     // ---- disabled controls ----
     int   disabled_depth; // disabled_depth > 0 means "everything drawn right now is dimmed
     bool  disable_next;
-    // input state parked while the outermost disabled scope is open
-    float saved_mouse_x, saved_mouse_y, saved_mouse_dx, saved_mouse_dy;
-    float saved_wheel;
-    int   saved_mouse_down[3], saved_mouse_pressed[3], saved_mouse_released[3];
-    int   saved_num_key_events, saved_num_char_events;
+    UIInputSnapshot disabled_parked; // held while the outermost disabled scope is open
 
     // ---- immediate-mode interaction ----
     int   hot_id;             // hovered widget (0 = none)
     int   active_id;          // mouse-captured widget (0 = none)
     int   active_button;      // UI_MOUSE_BUTTON_* holding the capture
     void *active_state;       // per-control state (owned, freed on clear)
-    int   focus_id;           // keyboard focus (0 = none)
+    int   focus_id;           // keyboard focus (0 = none, UI_FOCUS_RELEASED = none, and no textarea takes it by default)
 
     // per-widget interaction query state (set by widget, read by user after call)
     int   last_widget_activated;   // last widget was activated (pressed) this frame
@@ -194,6 +246,11 @@ struct UIContext {
 
     // ---- window focus ----
     int   window_has_focus;
+
+    // Set during a frame by a widget that needs the Escape key to reach the UI (an open
+    // find dialog), cleared by ui_begin. A host that lets the OS or a plugin host act on
+    // Escape reads it after ui_end and routes Escape to the UI while it is set.
+    int   wants_escape;
 
     // slider drag anchor (relative-mode dragging)
     float slider_anchor_t;
@@ -236,6 +293,19 @@ struct UIContext {
     int           in_popup;
     float         popup_pen_x, popup_pen_y, popup_w;
     int           popup_bg_component_idx;
+
+    // ---- ui_popup_begin popup ----
+    // The body draws into popup_layer, which ui_end copies over the screen, so
+    // it lands on top whatever was drawn before or after it. While the mouse is
+    // over it, input is parked everywhere except inside the body.
+    UIPopup         popup;
+    OutputCell     *popup_layer;
+    UIPopupSaved    popup_saved;
+    int             in_popup_body;
+    int             popup_press_outside;
+    int             popup_input_parked;
+    UIInputSnapshot popup_parked;
+    int             theme_bg_lift;   // added to every slot's background inside a popup body
 };
 
 // ---- lifecycle ----
@@ -278,6 +348,8 @@ void ui_same_line_col(UIContext *ui, int col);    // Same row, at a fixed column
 
 void ui_push_item_width(UIContext *ui, float w);
 void ui_pop_item_width(UIContext *ui);
+void ui_push_label_width(UIContext *ui, int chars);
+void ui_pop_label_width(UIContext *ui);
 
 float ui_avail_width(UIContext *ui); // space from pen to content_max_x
 
@@ -333,6 +405,7 @@ void  ui_advance(UIContext *ui, float x, float y, float w, float h);
 // hashes differently from "Run##vis".
 int ui_label(UIContext *ui, const char *text);
 int ui_button(UIContext *ui, const char *text);
+int ui_button_flags(UIContext *ui, const char *text, int flags);
 int ui_radio_button(UIContext *ui, const char *text, int *value, int which);
 int ui_check_box(UIContext *ui, const char *text, bool *value);
 
@@ -369,6 +442,45 @@ bool ui_selectable(UIContext *ui, const char *text, bool is_selected);
 bool ui_menu_item(UIContext *ui, const char *text);
 bool ui_menu_toggle(UIContext *ui, const char *text, bool *checked);
 bool ui_hovering_enabled(UIContext *ui);
+
+// ---- popups holding any widgets ----
+// One open at a time; opening one closes the previous one and any legacy
+// dropdown / context popup. Between begin and end the body is an ordinary
+// layout grouping: lay widgets out from the pen as usual. After end the
+// caller's layout continues as if the popup was not there.
+// w/h: > 0 fixed, <= 0 measured from the body (measured popups need widgets
+// that do not stretch to the content region).
+void ui_popup_open(UIContext *ui, const char *str_id);                  // at the mouse
+void ui_popup_open_at(UIContext *ui, const char *str_id, float x, float y);
+void ui_popup_open_below_last(UIContext *ui, const char *str_id);       // under the last widget
+void ui_popup_close(UIContext *ui);
+int  ui_popup_is_open(UIContext *ui, const char *str_id);
+int  ui_popup_any_open(UIContext *ui);
+int  ui_popup_begin(UIContext *ui, const char *str_id, float w, float h, int flags);
+void ui_popup_end(UIContext *ui);
+
+// A dropdown-style header ("Show: C, Lua v") whose popup holds any widgets.
+// header_flags are the UI_DROPDOWN_* ones, popup_flags the UI_POPUP_* ones.
+int  ui_dropdown_panel_begin(UIContext *ui, const char *text, const char *cur_value,
+                             int header_flags, float w, float h, int popup_flags);
+void ui_dropdown_panel_end(UIContext *ui);
+
+// "Show: C, Lua v" over count on/off values. A click picks one item (or
+// none_label, which clears all) and closes, like a plain dropdown; while Ctrl
+// is held the rows are checkboxes and none_label a button, and it stays open
+// until Ctrl is released (only if something was changed while it was held).
+// Opened on more than one selected item, it shows the checkbox view until
+// none_label is clicked without Ctrl.
+// Returns a bitmask of the items that changed (count <= 31).
+int  ui_multi_dropdown(UIContext *ui, const char *text, int count, const char *const items[],
+                       bool *values, const char *none_label);
+// With every item on (count > 1) the header says "All" instead of listing them.
+// UI_MULTI_CHECKBOXES: always the checkbox view, no Ctrl needed, stays open,
+// and a NULL none_label means no clear-all button (the header still says "None").
+// disabled (optional, count entries): greyed-out items that cannot change.
+#define UI_MULTI_CHECKBOXES (1 << 0)
+int  ui_multi_dropdown_ex(UIContext *ui, const char *text, int count, const char *const items[],
+                          bool *values, const char *none_label, int flags, const bool *disabled);
 
 // Swallow this frame's press edge so nothing drawn later can claim the same
 // click. For a press handled outside the widget/capture system.
@@ -502,6 +614,10 @@ void ui_helper_draw_round_rect(UIContext *ui, int col, int row, int width, int h
 #define UI_MOUSE_TYPE_UP     2
 #define UI_MOUSE_TYPE_DRAG   3
 #define UI_MOUSE_TYPE_WHEEL  4
+
+#define UI_KEY_ESCAPE 0x1B
+
+#define UI_FOCUS_RELEASED (-1)
 
 #define UI_MOUSE_BUTTON_NONE   -1
 #define UI_MOUSE_BUTTON_LEFT    0
